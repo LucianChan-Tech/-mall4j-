@@ -7,7 +7,6 @@
  *
  * 版权所有，侵权必究！
  */
-
 package com.yami.shop.admin.task;
 
 import cn.hutool.core.collection.CollectionUtil;
@@ -27,15 +26,12 @@ import org.springframework.stereotype.Component;
 import java.util.Date;
 import java.util.List;
 
-
 /**
- * @author FrozenWatermelon
- * 定时任务的配置，请查看xxl-job的java配置文件。
+ * @author FrozenWatermelon 定时任务的配置，请查看xxl-job的java配置文件。
  * @see com.yami.shop.admin.config.XxlJobConfig
  */
 @Component("orderTask")
 public class OrderTask {
-
 
     private static final Logger logger = LoggerFactory.getLogger(OrderTask.class);
 
@@ -47,11 +43,11 @@ public class OrderTask {
     private SkuService skuService;
 
     @XxlJob("cancelOrder")
-    public void cancelOrder(){
+    public void cancelOrder() {
         Date now = new Date();
         logger.info("取消超时未支付订单。。。");
         // 获取30分钟之前未支付的订单
-        List<Order> orders = orderService.listOrderAndOrderItems(OrderStatus.UNPAY.value(),DateUtil.offsetMinute(now, -30));
+        List<Order> orders = orderService.listOrderAndOrderItems(OrderStatus.UNPAY.value(), DateUtil.offsetMinute(now, -30));
         if (CollectionUtil.isEmpty(orders)) {
             return;
         }
@@ -60,7 +56,7 @@ public class OrderTask {
             List<OrderItem> orderItems = order.getOrderItems();
             for (OrderItem orderItem : orderItems) {
                 productService.removeProductCacheByProdId(orderItem.getProdId());
-                skuService.removeSkuCacheBySkuId(orderItem.getSkuId(),orderItem.getProdId());
+                skuService.removeSkuCacheBySkuId(orderItem.getSkuId(), orderItem.getProdId());
             }
         }
     }
@@ -69,11 +65,11 @@ public class OrderTask {
      * 确认收货
      */
     @XxlJob("confirmOrder")
-    public void confirmOrder(){
+    public void confirmOrder() {
         Date now = new Date();
         logger.info("系统自动确认收货订单。。。");
         // 获取15天之前未支付的订单
-        List<Order> orders = orderService.listOrderAndOrderItems(OrderStatus.CONSIGNMENT.value(),DateUtil.offsetDay(now, -15));
+        List<Order> orders = orderService.listOrderAndOrderItems(OrderStatus.CONSIGNMENT.value(), DateUtil.offsetDay(now, -15));
         if (CollectionUtil.isEmpty(orders)) {
             return;
         }
@@ -82,7 +78,7 @@ public class OrderTask {
             List<OrderItem> orderItems = order.getOrderItems();
             for (OrderItem orderItem : orderItems) {
                 productService.removeProductCacheByProdId(orderItem.getProdId());
-                skuService.removeSkuCacheBySkuId(orderItem.getSkuId(),orderItem.getProdId());
+                skuService.removeSkuCacheBySkuId(orderItem.getSkuId(), orderItem.getProdId());
             }
         }
     }
