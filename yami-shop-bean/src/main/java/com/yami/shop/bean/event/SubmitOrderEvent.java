@@ -7,7 +7,6 @@
  *
  * 版权所有，侵权必究！
  */
-
 package com.yami.shop.bean.event;
 
 import com.yami.shop.bean.app.dto.ShopCartItemDto;
@@ -22,11 +21,13 @@ import java.util.List;
 
 /**
  * 提交订单时的事件
+ *
  * @author LGH
  */
 @Data
 @AllArgsConstructor
 public class SubmitOrderEvent {
+
     /**
      * 完整的订单信息
      */
