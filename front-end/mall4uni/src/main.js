@@ -1,10 +1,10 @@
-import {
-  createSSRApp
-} from 'vue'
+import { createApp } from 'vue'
+import { createPinia } from 'pinia'
 import App from './App.vue'
-export function createApp () {
-  const app = createSSRApp(App)
-  return {
-    app
-  }
-}
+import router from './router'
+import './styles/main.css'
+
+const app = createApp(App)
+app.use(createPinia())
+app.use(router)
+app.mount('#app')

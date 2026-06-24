@@ -1,15 +1,19 @@
 <script setup>
-http.getCartCount()
+import AppLayout from '@/components/layout/AppLayout.vue'
+import { onMounted } from 'vue'
+import { useAppStore } from '@/stores/app'
+import { useUserStore } from '@/stores/user'
+
+const appStore = useAppStore()
+const userStore = useUserStore()
+
+onMounted(() => {
+  if (userStore.isLoggedIn) {
+    appStore.refreshCartCount()
+  }
+})
 </script>
 
-<style lang="scss" scoped>
-@import "./app.css";
-/* 隐藏头部 */
-uni-page-head {
-  display: none;
-}
-/* 轮播图指示点 */
-uni-swiper .uni-swiper-dots-horizontal {
-  bottom: 20px !important;
-}
-</style>
+<template>
+  <AppLayout />
+</template>
