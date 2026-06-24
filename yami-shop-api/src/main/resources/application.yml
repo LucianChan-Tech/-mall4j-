@@ -26,6 +26,13 @@ mybatis-plus:
       # 默认数据库表下划线命名
       table-underline: true
 
+# DeepSeek AI 智能客服配置
+deepseek:
+  # 请在 https://platform.deepseek.com/ 注册获取 API Key
+  api-key: sk-38a497502d18441999850db6dfb59dab
+  # API 地址（一般无需修改）
+  api-url: https://api.deepseek.com
+
 management:
   server:
     add-application-context-header: false

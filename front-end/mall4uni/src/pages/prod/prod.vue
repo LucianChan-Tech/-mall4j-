@@ -87,6 +87,9 @@
     </view>
     <!-- end 商品详情 -->
 
+    <!-- AI智能客服 -->
+    <ChatButton :product-id="prodId" />
+
     <!-- 底部按钮 -->
     <view class="cart-footer">
       <view
@@ -236,6 +239,8 @@
 </template>
 
 <script setup>
+import ChatButton from '@/components/ChatButton.vue'
+
 const wxs = number()
 
 const indicatorDots = ref(true)
