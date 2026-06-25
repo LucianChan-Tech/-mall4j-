@@ -478,3 +478,286 @@ function Stop-AllServices {
     & $LogCallback "All services stopped"
 }
 
+# ===== 项目端口定义 =====
+$script:ProjectPorts = @{
+    "Redis"      = 6379
+    "Admin"      = 8085
+    "API"        = 8086
+    "mall4v"     = 9527
+    "mall4uni"   = 5173
+}
+
+function Get-ServiceStatus {
+    <#
+    .SYNOPSIS
+        检测项目各服务当前运行状态（基于端口监听 + 进程名）
+    #>
+    $status = @{}
+    foreach ($svc in $script:ProjectPorts.Keys) {
+        $port = $script:ProjectPorts[$svc]
+        $check = Check-Port -Port $port
+        $status[$svc] = @{
+            Port        = $port
+            Running     = $check.InUse
+            ProcessName = $check.ProcessName
+            Pid         = $check.Pid
+        }
+    }
+    return $status
+}
+
+function Stop-ServiceOnPort {
+    <#
+    .SYNOPSIS
+        强制终止占用指定端口的进程
+    #>
+    param(
+        [int]$Port,
+        [string]$ServiceLabel,
+        [scriptblock]$LogCallback
+    )
+    $check = Check-Port -Port $Port
+    if (-not $check.InUse) {
+        & $LogCallback "  [$ServiceLabel] Port $Port — 未占用，跳过"
+        return $false
+    }
+    if ($check.Pid) {
+        try {
+            $proc = Get-Process -Id $check.Pid -ErrorAction Stop
+            & $LogCallback "  [$ServiceLabel] 终止进程 PID=$($check.Pid) ($($proc.ProcessName))..."
+            $proc.Kill()
+            $proc.WaitForExit(3000)
+            & $LogCallback "  [$ServiceLabel] 已终止"
+            return $true
+        } catch {
+            & $LogCallback "  [$ServiceLabel] 终止失败: $_，尝试 taskkill..."
+            try {
+                & taskkill /F /PID $check.Pid 2>&1 | Out-Null
+                & $LogCallback "  [$ServiceLabel] taskkill 完成"
+                return $true
+            } catch {
+                & $LogCallback "  [$ServiceLabel] taskkill 也失败: $_"
+            }
+        }
+    }
+    return $false
+}
+
+function Stop-AndReleaseAll {
+    <#
+    .SYNOPSIS
+        全面关闭 ALL：状态检查 → 依次关闭服务 → 释放端口 → 解除占用
+    .DESCRIPTION
+        比 Stop-AllServices 更彻底：
+          - 依次关闭 admin → api → mall4v → mall4uni
+          - 停止 Redis Docker 容器
+          - 按端口强制释放（taskkill /F）
+          - 最终残留进程清扫
+    #>
+    param([scriptblock]$LogCallback)
+    if (-not $LogCallback) { $LogCallback = { param($m) } }
+
+    # ---------------------------------------------------------------
+    # Phase 1: 状态检查
+    # ---------------------------------------------------------------
+    & $LogCallback "====== 启动全面关闭 ======"
+    & $LogCallback ""
+    & $LogCallback "[Phase 1/5] 检查各服务运行状态..."
+    $status = Get-ServiceStatus
+    $runningCount = 0
+    foreach ($svc in $status.Keys) {
+        $info = $status[$svc]
+        $flag = if ($info.Running) { "● 运行中" } else { "○ 空闲" }
+        $extra = if ($info.Pid) { " (PID=$($info.Pid), $($info.ProcessName))" } else { "" }
+        & $LogCallback "  $flag  $svc :$($info.Port)$extra"
+        if ($info.Running) { $runningCount++ }
+    }
+    if ($runningCount -eq 0) {
+        & $LogCallback "  没有服务在运行，无需关闭"
+        & $LogCallback ""
+        & $LogCallback "====== 全面关闭完成（无需操作） ======"
+        & $LogCallback "//已终结商城程序，完成端口的释放"
+        return
+    }
+    & $LogCallback "  共 $runningCount 个服务/端口需要关闭"
+    & $LogCallback ""
+
+    # ---------------------------------------------------------------
+    # Phase 2: 关闭 Java 后端 (admin → api)
+    # ---------------------------------------------------------------
+    & $LogCallback "[Phase 2/5] 关闭后端服务..."
+    # 先杀匹配 yami-shop 的 java 进程（覆盖 admin 和 api）
+    $javaProcs = Get-Process -Name "java" -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.CommandLine -match "yami-shop" } catch { $false }
+    }
+    if ($javaProcs) {
+        foreach ($proc in $javaProcs) {
+            & $LogCallback "  终止 Java 后端 PID=$($proc.Id) (yami-shop)..."
+            try { $proc.Kill(); $proc.WaitForExit(3000) } catch {}
+        }
+        & $LogCallback "  已终止 $($javaProcs.Count) 个 Java 后端进程"
+    } else {
+        & $LogCallback "  未发现运行中的 Java 后端进程"
+    }
+
+    # 再按端口确认释放
+    Stop-ServiceOnPort -Port 8085 -ServiceLabel "Admin(8085)" -LogCallback $LogCallback | Out-Null
+    Stop-ServiceOnPort -Port 8086 -ServiceLabel "API(8086)" -LogCallback $LogCallback | Out-Null
+    & $LogCallback ""
+
+    # ---------------------------------------------------------------
+    # Phase 3: 通过进程父子关系杀前端整棵树（node→parent cmd/npm/pnpm）
+    # ---------------------------------------------------------------
+    & $LogCallback "[Phase 3/5] 终止前端进程树..."
+    $frontKilled = 0
+    $frontendPorts = @{9527 = "mall4v"; 5173 = "mall4uni"}
+    foreach ($port in $frontendPorts.Keys) {
+        $svcLabel = $frontendPorts[$port]
+        $check = Check-Port -Port $port
+        if ($check.InUse -and $check.Pid) {
+            try {
+                $parentPid = (Get-CimInstance Win32_Process -Filter "ProcessId=$($check.Pid)" -ErrorAction Stop).ParentProcessId
+                if ($parentPid -and $parentPid -gt 0) {
+                    & $LogCallback ("  终止 " + $svcLabel + " 进程树: 父 PID=" + $parentPid + " (子 node PID=" + $check.Pid + ")")
+                    & taskkill /F /T /PID $parentPid 2>&1 | Out-Null
+                    $frontKilled++
+                    continue
+                }
+            } catch {
+                & $LogCallback ("  WMI 查询失败 " + $svcLabel + " PID=" + $check.Pid + ": " + $_)
+            }
+            Stop-ServiceOnPort -Port $port -ServiceLabel "$svcLabel($port)" -LogCallback $LogCallback | Out-Null
+            $frontKilled++
+        } else {
+            & $LogCallback ("  " + $svcLabel + "(:" + $port + ") 已空闲")
+        }
+    }
+    if ($frontKilled -gt 0) {
+        & $LogCallback ("  已终止 " + $frontKilled + " 个前端进程树")
+    } else {
+        & $LogCallback "  未找到前端进程"
+    }
+    & $LogCallback ""
+
+    # ---------------------------------------------------------------
+    # Phase 4: 停止 Redis Docker 容器
+    # ---------------------------------------------------------------
+    & $LogCallback "[Phase 4/5] 停止 Redis Docker 容器..."
+    try {
+        $redisContainer = & docker ps -a --filter "name=yami-redis" --format "{{.ID}}" 2>&1
+        if ($redisContainer) {
+            & $LogCallback "  发现 Redis 容器 ($redisContainer)，正在停止并移除..."
+            & docker rm -f yami-redis 2>&1 | Out-Null
+            & $LogCallback "  Redis 容器已移除"
+        } else {
+            & $LogCallback "  未发现 Redis 容器 (yami-redis)"
+        }
+    } catch {
+        & $LogCallback "  Docker 操作失败（可能 Docker 未运行）: $_"
+    }
+    & $LogCallback ""
+
+    # ---------------------------------------------------------------
+    # Phase 5: 最终端口扫描 + 强制释放
+    # ---------------------------------------------------------------
+    & $LogCallback "[Phase 5/5] 最终扫描 + 强制释放所有项目及 Vite HMR 端口..."
+    $stillBusy = @()
+    $allPorts = @{}
+    foreach ($kv in $script:ProjectPorts.GetEnumerator()) { $allPorts[$kv.Key] = $kv.Value }
+    $allPorts["mall4v-hmr1"] = 9528; $allPorts["mall4v-hmr2"] = 9529; $allPorts["mall4v-hmr3"] = 9530
+    $allPorts["mall4uni-hmr1"] = 5174; $allPorts["mall4uni-hmr2"] = 5175
+    foreach ($svc in $allPorts.Keys) {
+        $port = $allPorts[$svc]
+        $check = Check-Port -Port $port
+        if ($check.InUse) {
+            & $LogCallback "  ⚠ $svc(:$port) 仍被 $($check.ProcessName)(PID=$($check.Pid)) 占用，强制释放..."
+            try {
+                & taskkill /F /PID $check.Pid 2>&1 | Out-Null
+                Start-Sleep -Milliseconds 500
+                $recheck = Check-Port -Port $port
+                if ($recheck.InUse) {
+                    & $LogCallback "  ✗ $svc(:$port) 释放失败"
+                    $stillBusy += $svc
+                } else {
+                    & $LogCallback "  ✓ $svc(:$port) 已释放"
+                }
+            } catch {
+                & $LogCallback "  ✗ $svc(:$port) 强制释放出错: $_"
+                $stillBusy += $svc
+            }
+        } else {
+            & $LogCallback "  ✓ $svc(:$port) — 空闲"
+        }
+    }
+    & $LogCallback ""
+
+    # ---------------------------------------------------------------
+    # Phase 5b: 补杀残留 node/vite（按命令行匹配）+ 辅助端口
+    # ---------------------------------------------------------------
+    & $LogCallback "[Phase 5/5b] 清理残留进程..."
+    $nodeKilled = 0
+
+    function Test-IsFrontendProc {
+        param([int]$Pid)
+        try {
+            $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId=$Pid" -ErrorAction Stop).CommandLine
+            if (-not $cmdLine) { return $false }
+            if ($cmdLine -match "front-end[\\/]mall4v" -or $cmdLine -match "front-end[\\/]mall4uni") { return $true }
+            if ($cmdLine -match "mall4v" -or $cmdLine -match "mall4uni") { return $true }
+        } catch {}
+        return $false
+    }
+
+    foreach ($cname in @("node", "vite")) {
+        Get-Process -Name $cname -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                if (Test-IsFrontendProc -Pid $_.Id) {
+                    & $LogCallback ("  终止残留 " + $cname + " PID=" + $_.Id)
+                    & taskkill /F /PID $_.Id 2>&1 | Out-Null
+                    $nodeKilled++
+                }
+            } catch {}
+        }
+    }
+
+    foreach ($auxPort in @(9528,9529,9530,5174,5175)) {
+        $check = Check-Port -Port $auxPort
+        if ($check.InUse -and $check.Pid) {
+            & $LogCallback ("  释放辅助端口 " + $auxPort + " (PID=" + $check.Pid + ")")
+            & taskkill /F /PID $check.Pid 2>&1 | Out-Null
+            $nodeKilled++
+        }
+    }
+    }
+    # 第 3 步：按辅助端口补杀
+    foreach ($auxPort in @(9528,9529,9530,5174,5175)) {
+        $check = Check-Port -Port $auxPort
+        if ($check.InUse -and $check.Pid) {
+            & $LogCallback ("  释放辅助端口 " + $auxPort + " (PID=" + $check.Pid + ")")
+            & taskkill /F /PID $check.Pid 2>&1 | Out-Null
+            $nodeKilled++
+        }
+    }
+    if ($nodeKilled -gt 0) {
+        & $LogCallback ("  已清理 " + $nodeKilled + " 个残留 node 进程")
+    } else {
+        & $LogCallback "  无残留 node 进程"
+    }
+    & $LogCallback ""
+
+    # ---------------------------------------------------------------
+    # 总结
+    # ---------------------------------------------------------------
+    if ($stillBusy.Count -eq 0) {
+        & $LogCallback "====== 全面关闭完成！所有端口已释放 ======"
+        & $LogCallback "//已终结商城程序，完成端口的释放"
+    } else {
+        & $LogCallback "====== 全面关闭完成，但以下端口仍被占用 ======"
+        & $LogCallback "//已终结商城程序，完成端口的释放（部分端口未释放）"
+        foreach ($s in $stillBusy) {
+            & $LogCallback "   ✗ $s :$($script:ProjectPorts[$s])"
+        }
+        & $LogCallback "请手动检查（管理员权限下运行: netstat -ano | findstr :PORT）"
+    }
+}
+

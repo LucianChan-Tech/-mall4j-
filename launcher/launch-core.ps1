@@ -64,9 +64,9 @@ function Set-StepUI {
         $item.Status = $Status
         $item.StatusText = $Text
         switch ($Status) {
-            "completed" { $item.StatusColor = "#07C160"; $item.StatusIcon = "V"; $item.StatusTextColor = "#07C160" }
+            "completed" { $item.StatusColor = "#2216ff"; $item.StatusIcon = "V"; $item.StatusTextColor = "#2216ff" }
             "failed"    { $item.StatusColor = "#FA5151"; $item.StatusIcon = "X"; $item.StatusTextColor = "#FA5151" }
-            "running"   { $item.StatusColor = "#07C160"; $item.StatusIcon = "~"; $item.StatusTextColor = "#07C160" }
+            "running"   { $item.StatusColor = "#2216ff"; $item.StatusIcon = "~"; $item.StatusTextColor = "#2216ff" }
             default     { $item.StatusColor = "#DDDDDD"; $item.StatusIcon = "o"; $item.StatusTextColor = "#999999" }
         }
         try { $sl.Items.Refresh() } catch {}
@@ -74,7 +74,7 @@ function Set-StepUI {
 }
 
 function Set-StatusBarUI {
-    param([string]$Text, [string]$Color = "#07C160")
+    param([string]$Text, [string]$Color = "#2216ff")
     if (-not $Window) { return }
     $Window.Dispatcher.Invoke([Action]{
         $lbl = $Window.FindName("lblStatus")
@@ -85,13 +85,13 @@ function Set-StatusBarUI {
 }
 
 function Enable-ButtonsUI {
-    param([bool]$Start, [bool]$Stop)
+    param([bool]$Start, [bool]$End)
     if (-not $Window) { return }
     $Window.Dispatcher.Invoke([Action]{
         $bs = $Window.FindName("btnStart")
-        $bp = $Window.FindName("btnStop")
+        $bp = $Window.FindName("btnEnd")
         if ($bs) { $bs.IsEnabled = $Start }
-        if ($bp) { $bp.IsEnabled = $Stop }
+        if ($bp) { $bp.IsEnabled = $End }
     }, "Normal")
 }
 
@@ -139,7 +139,7 @@ try {
                 Write-LogUI -Message "Import failed, please import manually: db/yami_shop.sql" -Level "ERROR"
                 Set-StepUI -Id 1 -Status "failed" -Text "Import failed"
                 Set-StatusBarUI -Text "DB import failed" -Color "#FA5151"
-                Enable-ButtonsUI -Start $true -Stop $false
+                Enable-ButtonsUI -Start $true -End $false
                 throw "Abort: DB import failed"
             }
         }
@@ -148,7 +148,7 @@ try {
         Write-LogUI -Message "Update MySQL credentials and retry" -Level "INFO"
         Set-StepUI -Id 1 -Status "failed" -Text "Connection failed"
         Set-StatusBarUI -Text "MySQL connection failed" -Color "#FA5151"
-        Enable-ButtonsUI -Start $true -Stop $false
+        Enable-ButtonsUI -Start $true -End $false
         throw "Abort: MySQL connection failed"
     }
 
@@ -189,7 +189,7 @@ try {
             Write-LogUI -Message "Alternatively, copy pre-built JARs to target/ directories." -Level "INFO"
             Set-StepUI -Id 3 -Status "failed" -Text "Download failed"
             Set-StatusBarUI -Text "Maven download failed" -Color "#FA5151"
-            Enable-ButtonsUI -Start $true -Stop $false
+            Enable-ButtonsUI -Start $true -End $false
             throw "Abort: Maven download failed"
         }
         Write-LogUI -Message "Maven ready: $mvnPath" -Level "SUCCESS"
@@ -201,7 +201,7 @@ try {
             Write-LogUI -Message "Step 3 error: $_" -Level "ERROR"
             Set-StepUI -Id 3 -Status "failed" -Text "Error"
             Set-StatusBarUI -Text "Build failed" -Color "#FA5151"
-            Enable-ButtonsUI -Start $true -Stop $false
+            Enable-ButtonsUI -Start $true -End $false
             throw "Abort: Build exception"
         }
         if ($mavenResult.Success) {
@@ -211,14 +211,14 @@ try {
             Write-LogUI -Message "Build failed, check code and retry" -Level "ERROR"
             Set-StepUI -Id 3 -Status "failed" -Text "Build failed"
             Set-StatusBarUI -Text "Build failed" -Color "#FA5151"
-            Enable-ButtonsUI -Start $true -Stop $false
+            Enable-ButtonsUI -Start $true -End $false
             throw "Abort: Build failed"
         }
     }
 
     # ===== Step 4: Start admin Backend =====
     Set-StepUI -Id 4 -Status "running" -Text "Starting..."
-    Set-StatusBarUI -Text "Starting admin backend..." -Color "#07C160"
+    Set-StatusBarUI -Text "Starting admin backend..." -Color "#2216ff"
     try {
         $adminResult = Start-BackendService -ServiceName "admin" -ProjectRoot $ProjectRoot -MysqlUser $MysqlUser -MysqlPass $MysqlPass -LogCallback $logCb
     } catch {
@@ -235,7 +235,7 @@ try {
 
     # ===== Step 5: Start api Backend =====
     Set-StepUI -Id 5 -Status "running" -Text "Starting..."
-    Set-StatusBarUI -Text "Starting api backend..." -Color "#07C160"
+    Set-StatusBarUI -Text "Starting api backend..." -Color "#2216ff"
     try {
         $apiResult = Start-BackendService -ServiceName "api" -ProjectRoot $ProjectRoot -MysqlUser $MysqlUser -MysqlPass $MysqlPass -LogCallback $logCb
     } catch {
@@ -252,7 +252,7 @@ try {
 
     # ===== Step 6: Start mall4v Frontend =====
     Set-StepUI -Id 6 -Status "running" -Text "Starting..."
-    Set-StatusBarUI -Text "Starting mall4v frontend..." -Color "#07C160"
+    Set-StatusBarUI -Text "Starting mall4v frontend..." -Color "#2216ff"
     try {
         $mall4vResult = Start-FrontendService -FrontendName "mall4v" -ProjectRoot $ProjectRoot -LogCallback $logCb -TimeoutSeconds 120
     } catch {
@@ -269,7 +269,7 @@ try {
 
     # ===== Step 7: Start mall4uni Frontend =====
     Set-StepUI -Id 7 -Status "running" -Text "Starting..."
-    Set-StatusBarUI -Text "Starting mall4uni frontend..." -Color "#07C160"
+    Set-StatusBarUI -Text "Starting mall4uni frontend..." -Color "#2216ff"
     try {
         $mall4uniResult = Start-FrontendService -FrontendName "mall4uni" -ProjectRoot $ProjectRoot -LogCallback $logCb -TimeoutSeconds 120
     } catch {
@@ -297,7 +297,7 @@ try {
         Write-LogUI -Message "  Api API:   http://127.0.0.1:8086" -Level "SUCCESS"
         Write-LogUI -Message "  API Doc:   http://127.0.0.1:8085/doc.html" -Level "SUCCESS"
         Write-LogUI -Message "==========================================" -Level "SUCCESS"
-        Set-StatusBarUI -Text "All services started!" -Color "#07C160"
+        Set-StatusBarUI -Text "All services started!" -Color "#2216ff"
         Show-MessageBoxUI -Message "Mall4j started!" -Title "Success"
     } else {
         Set-StatusBarUI -Text "Some services failed, check log" -Color "#FA5151"
@@ -306,5 +306,5 @@ try {
 } catch {
     Write-LogUI -Message "Abort: $_" -Level "ERROR"
 } finally {
-    Enable-ButtonsUI -Start $true -Stop $false
+    Enable-ButtonsUI -Start $true -End $false
 }

@@ -45,7 +45,7 @@ if (-not $script:ScriptDir) {
 }
 
 if (-not $script:ScriptDir) {
-    Write-Host "[FATAL] Cannot find launcher directory. Make sure Mall4jLauncher.exe is in the launcher/ folder."
+    Write-Host "[FATAL] Cannot find launcher directory. Make sure E-mall Launcher.exe is in the launcher/ folder."
     Write-Host "Looked in: exe dir, PSScriptRoot, MyInvocation, current dir"
     Read-Host "Press Enter to exit"
     exit 1
@@ -646,6 +646,246 @@ function Stop-AllServices {
     & $LogCallback "All services stopped"
 }
 
+# ===== 新增：项目端口定义 =====
+$script:ProjectPorts = @{
+    "Redis"      = 6379
+    "Admin"      = 8085
+    "API"        = 8086
+    "mall4v"     = 9527
+    "mall4uni"   = 5173
+}
+
+function Get-ServiceStatus {
+    $status = @{}
+    foreach ($svc in $script:ProjectPorts.Keys) {
+        $port = $script:ProjectPorts[$svc]
+        $check = Check-Port -Port $port
+        $status[$svc] = @{
+            Port        = $port
+            Running     = $check.InUse
+            ProcessName = $check.ProcessName
+            Pid         = $check.Pid
+        }
+    }
+    return $status
+}
+
+function Stop-ServiceOnPort {
+    param([int]$Port, [string]$ServiceLabel, [scriptblock]$LogCallback)
+    $check = Check-Port -Port $Port
+    if (-not $check.InUse) {
+        & $LogCallback "  [$ServiceLabel] Port $Port - FREE, skip"
+        return $false
+    }
+    if ($check.Pid) {
+        try {
+            $proc = Get-Process -Id $check.Pid -ErrorAction Stop
+            & $LogCallback ("  [$ServiceLabel] Killing PID=" + $check.Pid + " (" + $proc.ProcessName + ")...")
+            $proc.Kill()
+            $proc.WaitForExit(3000)
+            & $LogCallback "  [$ServiceLabel] Killed"
+            return $true
+        } catch {
+            & $LogCallback ("  [$ServiceLabel] Kill failed: " + $_ + ", trying taskkill...")
+            try {
+                & taskkill /F /PID $check.Pid 2>&1 | Out-Null
+                & $LogCallback "  [$ServiceLabel] taskkill done"
+                return $true
+            } catch {
+                & $LogCallback ("  [$ServiceLabel] taskkill also failed: " + $_)
+            }
+        }
+    }
+    return $false
+}
+
+function Stop-AndReleaseAll {
+    param([scriptblock]$LogCallback)
+    if (-not $LogCallback) { $LogCallback = { param($m) } }
+
+    & $LogCallback "====== Starting full cleanup ======"
+    & $LogCallback ""
+    & $LogCallback "[Phase 1/5] Checking service status..."
+    $status = Get-ServiceStatus
+    $runningCount = 0
+    foreach ($svc in $status.Keys) {
+        $info = $status[$svc]
+        $flag = "FREE"
+        if ($info.Running) { $flag = "BUSY" }
+        $extra = ""
+        if ($info.Pid) { $extra = " (PID=" + $info.Pid + ", " + $info.ProcessName + ")" }
+        & $LogCallback ("  " + $flag + "  " + $svc + " :" + $info.Port + $extra)
+        if ($info.Running) { $runningCount++ }
+    }
+    if ($runningCount -eq 0) {
+        & $LogCallback "  No services running, nothing to clean up"
+        & $LogCallback ""
+        & $LogCallback "====== Cleanup complete (nothing to do) ======"
+        & $LogCallback "//已终结商城程序，完成端口的释放"
+        return
+    }
+    & $LogCallback ("  " + $runningCount + " service(s)/port(s) need cleanup")
+    & $LogCallback ""
+
+    # Phase 2: Shutdown Java backends
+    & $LogCallback "[Phase 2/5] Stopping backend services..."
+    $javaProcs = Get-Process -Name "java" -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.CommandLine -match "yami-shop" } catch { $false }
+    }
+    if ($javaProcs) {
+        foreach ($proc in $javaProcs) {
+            & $LogCallback ("  Killing Java PID=" + $proc.Id + " (yami-shop)...")
+            try { $proc.Kill(); $proc.WaitForExit(3000) } catch {}
+        }
+        & $LogCallback ("  Killed " + $javaProcs.Count + " Java backend process(es)")
+    } else {
+        & $LogCallback "  No Java backend processes found (yami-shop)"
+    }
+    Stop-ServiceOnPort -Port 8085 -ServiceLabel "Admin(8085)" -LogCallback $LogCallback | Out-Null
+    Stop-ServiceOnPort -Port 8086 -ServiceLabel "API(8086)" -LogCallback $LogCallback | Out-Null
+    & $LogCallback ""
+
+    # Phase 3: Kill frontends by finding parent process tree (node→parent cmd/npm/pnpm)
+    & $LogCallback "[Phase 3/5] Killing frontend process trees..."
+    # Step 3a: Get node PIDs on frontend ports, then trace up to parent and kill the tree
+    $frontendPorts = @{9527 = "mall4v"; 5173 = "mall4uni"}
+    $frontKilled = 0
+    foreach ($port in $frontendPorts.Keys) {
+        $svcLabel = $frontendPorts[$port]
+        $check = Check-Port -Port $port
+        if ($check.InUse -and $check.Pid) {
+            # Get the parent PID of this node process via WMI
+            try {
+                $parentPid = (Get-CimInstance Win32_Process -Filter "ProcessId=$($check.Pid)" -ErrorAction Stop).ParentProcessId
+                if ($parentPid -and $parentPid -gt 0) {
+                    # Kill the PARENT process tree (cmd.exe) — this kills node + npm/pnpm atomically
+                    & $LogCallback ("  Killing " + $svcLabel + " process tree: parent PID=" + $parentPid + " (child node PID=" + $check.Pid + ")")
+                    & taskkill /F /T /PID $parentPid 2>&1 | Out-Null
+                    $frontKilled++
+                    continue  # parent tree killed, skip the direct port kill
+                }
+            } catch {
+                & $LogCallback ("  WMI lookup failed for " + $svcLabel + " PID=" + $check.Pid + ": " + $_)
+            }
+            # Fallback: kill node directly by port
+            Stop-ServiceOnPort -Port $port -ServiceLabel "$svcLabel($port)" -LogCallback $LogCallback | Out-Null
+            $frontKilled++
+        } else {
+            & $LogCallback ("  " + $svcLabel + "(:" + $port + ") already free")
+        }
+    }
+    if ($frontKilled -gt 0) {
+        & $LogCallback ("  Killed " + $frontKilled + " frontend process tree(s)")
+    } else {
+        & $LogCallback "  No frontend processes found"
+    }
+    & $LogCallback ""
+
+    # Phase 4: Stop Redis Docker container
+    & $LogCallback "[Phase 4/5] Stopping Redis Docker..."
+    try {
+        $redisContainer = & docker ps -a --filter "name=yami-redis" --format "{{.ID}}" 2>&1
+        if ($redisContainer) {
+            & $LogCallback ("  Found Redis container (" + $redisContainer + "), removing...")
+            & docker rm -f yami-redis 2>&1 | Out-Null
+            & $LogCallback "  Redis container removed"
+        } else {
+            & $LogCallback "  No Redis container (yami-redis) found"
+        }
+    } catch {
+        & $LogCallback ("  Docker error (maybe not running): " + $_)
+    }
+    & $LogCallback ""
+
+    # Phase 5: Force-release all project ports + Vite HMR aux ports + residual node
+    & $LogCallback "[Phase 5/5] Final scan + force-release all ports..."
+    $stillBusy = @()
+    $allPorts = @{}
+    foreach ($kv in $script:ProjectPorts.GetEnumerator()) { $allPorts[$kv.Key] = $kv.Value }
+    $allPorts["mall4v-hmr1"] = 9528; $allPorts["mall4v-hmr2"] = 9529; $allPorts["mall4v-hmr3"] = 9530
+    $allPorts["mall4uni-hmr1"] = 5174; $allPorts["mall4uni-hmr2"] = 5175
+    foreach ($svc in $allPorts.Keys) {
+        $port = $allPorts[$svc]
+        $check = Check-Port -Port $port
+        if ($check.InUse) {
+            & $LogCallback ("  WARNING " + $svc + "(:" + $port + ") still owned by " + $check.ProcessName + "(PID=" + $check.Pid + "), force killing...")
+            try {
+                & taskkill /F /PID $check.Pid 2>&1 | Out-Null
+                Start-Sleep -Milliseconds 500
+                $recheck = Check-Port -Port $port
+                if ($recheck.InUse) {
+                    & $LogCallback ("  FAIL " + $svc + "(:" + $port + ") release failed")
+                    $stillBusy += $svc
+                } else {
+                    & $LogCallback ("  OK " + $svc + "(:" + $port + ") released")
+                }
+            } catch {
+                & $LogCallback ("  FAIL " + $svc + "(:" + $port + ") error: " + $_)
+                $stillBusy += $svc
+            }
+        } else {
+            & $LogCallback ("  OK " + $svc + "(:" + $port + ") - free")
+        }
+    }
+    & $LogCallback ""
+
+    # Phase 5b: Kill residual node/vite processes by cmdline + aux ports
+    & $LogCallback "[Phase 5/5b] Cleaning up residual processes..."
+    $nodeKilled = 0
+
+    # Helper: check if a process cmdline contains frontend paths
+    function Test-IsFrontendProc {
+        param([int]$Pid)
+        try {
+            $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId=$Pid" -ErrorAction Stop).CommandLine
+            if (-not $cmdLine) { return $false }
+            if ($cmdLine -match "front-end[\\/]mall4v" -or $cmdLine -match "front-end[\\/]mall4uni") { return $true }
+            if ($cmdLine -match "mall4v" -or $cmdLine -match "mall4uni") { return $true }
+        } catch {}
+        return $false
+    }
+
+    # Kill residual node / vite processes by cmdline
+    foreach ($cname in @("node", "vite")) {
+        Get-Process -Name $cname -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                if (Test-IsFrontendProc -Pid $_.Id) {
+                    & $LogCallback ("  Killing residual " + $cname + " PID=" + $_.Id)
+                    & taskkill /F /PID $_.Id 2>&1 | Out-Null
+                    $nodeKilled++
+                }
+            } catch { }
+        }
+    }
+
+    # Kill by Vite auxiliary ports (cleanup whatever remains)
+    foreach ($auxPort in @(9528,9529,9530,5174,5175)) {
+        $check = Check-Port -Port $auxPort
+        if ($check.InUse -and $check.Pid) {
+            & $LogCallback ("  Killing on aux port " + $auxPort + " (PID=" + $check.Pid + ")")
+            & taskkill /F /PID $check.Pid 2>&1 | Out-Null
+            $nodeKilled++
+        }
+    }
+    if ($nodeKilled -gt 0) {
+        & $LogCallback ("  Cleaned up " + $nodeKilled + " residual node process(es)")
+    } else {
+        & $LogCallback "  No residual node processes found"
+    }
+    & $LogCallback ""
+
+    if ($stillBusy.Count -eq 0) {
+        & $LogCallback "====== Cleanup complete! All ports released ======"
+        & $LogCallback "//已终结商城程序，完成端口的释放"
+    } else {
+        & $LogCallback "====== Cleanup complete, but some ports still occupied ======"
+        & $LogCallback "//已终结商城程序，完成端口的释放（部分端口未释放）"
+        foreach ($s in $stillBusy) {
+            & $LogCallback ("  FAIL " + $s + " :" + $script:ProjectPorts[$s])
+        }
+    }
+}
+
 # ===== 内联模块：LogManager.ps1 =====
 $script:LogFilePath = $null
 
@@ -724,8 +964,17 @@ $ui.stepList    = Get-UI "stepList"
 $ui.txtLog      = Get-UI "txtLog"
 $ui.btnClearLog = Get-UI "btnClearLog"
 $ui.btnStart    = Get-UI "btnStart"
-$ui.btnStop     = Get-UI "btnStop"
+$ui.btnEnd      = Get-UI "btnEnd"
+$ui.appIcon     = Get-UI "appIcon"
 $ui.lblStatus   = Get-UI "lblStatus"
+
+# Set app icon from PNG (must exist alongside EXE)
+$iconPath = Join-Path $script:ScriptDir "E Logo Design Vector.png"
+if (Test-Path $iconPath) {
+    try {
+        $ui.appIcon.Source = [System.Windows.Media.Imaging.BitmapImage]::new((Resolve-Path $iconPath).Path)
+    } catch { }
+}
 
 #=============================================
 # 4. Steps Definition
@@ -773,7 +1022,7 @@ function Write-Log {
 }
 
 function Set-Status {
-    param([string]$Text, [string]$Color = "#07C160")
+    param([string]$Text, [string]$Color = "#2216ff")
     $window.Dispatcher.Invoke([Action]{
         $ui.lblStatus.Text = $Text
         $ui.lblStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString($Color)
@@ -781,10 +1030,10 @@ function Set-Status {
 }
 
 function Enable-Buttons {
-    param([bool]$Start, [bool]$Stop)
+    param([bool]$Start, [bool]$End)
     $window.Dispatcher.Invoke([Action]{
         $ui.btnStart.IsEnabled = $Start
-        $ui.btnStop.IsEnabled = $Stop
+        $ui.btnEnd.IsEnabled = $End
     }, "Normal")
 }
 
@@ -815,7 +1064,7 @@ $ui.btnMinimize.Add_Click({ $window.WindowState = [System.Windows.WindowState]::
 
 # Close
 $ui.btnClose.Add_Click({
-    if (-not $ui.btnStop.IsEnabled) {
+    if (-not $ui.btnEnd.IsEnabled) {
         Write-LogDirect -Message "User requested exit while services running" -Level "WARN"
         $r = [System.Windows.MessageBox]::Show("Services are running, exit anyway?", "Confirm", "YesNo", "Question")
         if ($r -eq "No") { return }
@@ -849,7 +1098,7 @@ $ui.btnTestDb.Add_Click({
         $result = Test-MySqlConnection -User $ui.txtMysqlUser.Text -Password (Get-Password)
         if ($result.Success) {
             Write-Log -Message $result.Message -Level "SUCCESS"
-            Set-Status -Text "DB connected" -Color "#07C160"
+            Set-Status -Text "DB connected" -Color "#2216ff"
         Write-LogDirect -Message $result.Message -Level "SUCCESS"
         } else {
             Write-Log -Message $result.Message -Level "ERROR"
@@ -908,9 +1157,9 @@ function Set-StepDirect {
     $item.Status = $Status
     $item.StatusText = $Text
     switch ($Status) {
-        "completed" { $item.StatusColor = "#07C160"; $item.StatusIcon = "V"; try { $item.StatusTextColor = "#07C160" } catch {} }
+        "completed" { $item.StatusColor = "#2216ff"; $item.StatusIcon = "V"; try { $item.StatusTextColor = "#2216ff" } catch {} }
         "failed"    { $item.StatusColor = "#FA5151"; $item.StatusIcon = "X"; try { $item.StatusTextColor = "#FA5151" } catch {} }
-        "running"   { $item.StatusColor = "#07C160"; $item.StatusIcon = "~"; try { $item.StatusTextColor = "#07C160" } catch {} }
+        "running"   { $item.StatusColor = "#2216ff"; $item.StatusIcon = "~"; try { $item.StatusTextColor = "#2216ff" } catch {} }
         default     { $item.StatusColor = "#DDDDDD"; $item.StatusIcon = "o"; try { $item.StatusTextColor = "#999999" } catch {} }
     }
     Update-StepUI
@@ -959,7 +1208,7 @@ function Process-Step {
                         Write-LogDirect -Message "Import failed, import manually: db/yami_shop.sql" -Level "ERROR"
                         Set-StepDirect -Id 1 -Status "failed" -Text "Import failed"
                         Set-Status -Text "DB import failed" -Color "#FA5151"
-                        Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1; return
+                        Enable-Buttons -Start $true -End $false; Stop-StepTimer; $script:Step = -1; return
                     }
                 }
                 $script:Step = 2
@@ -968,7 +1217,7 @@ function Process-Step {
                 Write-LogDirect -Message "Update MySQL credentials and retry" -Level "INFO"
                 Set-StepDirect -Id 1 -Status "failed" -Text "Connection failed"
                 Set-Status -Text "MySQL connection failed" -Color "#FA5151"
-                Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1
+                Enable-Buttons -Start $true -End $false; Stop-StepTimer; $script:Step = -1
             }
         }
         2 {  # Redis
@@ -987,7 +1236,7 @@ function Process-Step {
                         Write-LogDirect -Message "Docker command not found. Please install Docker Desktop." -Level "ERROR"
                         Set-StepDirect -Id 2 -Status "failed" -Text "Docker not found"
                         Set-Status -Text "Redis failed: Docker not installed" -Color "#FA5151"
-                        Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1; return
+                        Enable-Buttons -Start $true -End $false; Stop-StepTimer; $script:Step = -1; return
                     }
                     # 检查 Docker Desktop 是否运行
                     $dockerCheck = & docker info 2>&1
@@ -1026,7 +1275,7 @@ function Process-Step {
                     Set-StepDirect -Id 2 -Status "failed" -Text "Timeout"
                     Set-Status -Text "Redis start timeout" -Color "#FA5151"
                     $script:RedisStartTime = $null
-                    Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1
+                    Enable-Buttons -Start $true -End $false; Stop-StepTimer; $script:Step = -1
                 }
                 # 未超时且未就绪：继续等待（不输出日志避免刷屏，每 10 秒提示一次）
                 elseif ($elapsed % 10 -eq 0) {
@@ -1053,7 +1302,7 @@ function Process-Step {
                 Write-LogDirect -Message "Alternatively, copy pre-built JARs to target/ directories." -Level "INFO"
                 Set-StepDirect -Id 3 -Status "failed" -Text "Download failed"
                 Set-Status -Text "Maven download failed" -Color "#FA5151"
-                Enable-Buttons -Start $true -Stop $false
+                Enable-Buttons -Start $true -End $false
                 Stop-StepTimer
                 $script:Step = -1
                 return
@@ -1084,20 +1333,20 @@ function Process-Step {
             } else {
                 Set-Status -Text "Build failed" -Color "#FA5151"
                 Set-StepDirect -Id 3 -Status "failed" -Text "Build failed"
-                Enable-Buttons -Start $true -Stop $false
+                Enable-Buttons -Start $true -End $false
                 Stop-StepTimer
                 $script:Step = -1
             }
         }
         5 {  # Start admin
             Set-StepDirect -Id 4 -Status "running" -Text "Starting..."
-            Set-Status -Text "Starting admin backend..." -Color "#07C160"
+            Set-Status -Text "Starting admin backend..." -Color "#2216ff"
             Write-LogDirect -Message "Starting admin (port 8085)..." -Level "INFO"
             $jarFile = Join-Path $script:ProjectRoot "yami-shop-admin/target/yami-shop-admin-0.0.1-SNAPSHOT.jar"
             if (-not (Test-Path $jarFile)) {
                 Write-LogDirect -Message "JAR not found: $jarFile" -Level "ERROR"
                 Set-StepDirect -Id 4 -Status "failed" -Text "JAR not found"
-                Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1; return
+                Enable-Buttons -Start $true -End $false; Stop-StepTimer; $script:Step = -1; return
             }
             $logFile = "$env:TEMP\mall4j-admin.log"
             $javaArgs = @("-jar", "-Dspring.profiles.active=dev", "-Dspring.datasource.username=$($script:StepUser)", "-Dspring.datasource.password=$($script:StepPass)", "-Xms512m", "-Xmx512m", "`"$jarFile`"")
@@ -1105,7 +1354,7 @@ function Process-Step {
             if (-not $p) {
                 Write-LogDirect -Message "Failed to start admin process" -Level "ERROR"
                 Set-StepDirect -Id 4 -Status "failed" -Text "Launch failed"
-                Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1; return
+                Enable-Buttons -Start $true -End $false; Stop-StepTimer; $script:Step = -1; return
             }
             Write-LogDirect -Message "Admin process started (PID $($p.Id)), waiting for port 8085..." -Level "INFO"
             $script:AdminPid = $p.Id
@@ -1122,13 +1371,13 @@ function Process-Step {
         }
         7 {  # Start api
             Set-StepDirect -Id 5 -Status "running" -Text "Starting..."
-            Set-Status -Text "Starting api backend..." -Color "#07C160"
+            Set-Status -Text "Starting api backend..." -Color "#2216ff"
             Write-LogDirect -Message "Starting api (port 8086)..." -Level "INFO"
             $jarFile = Join-Path $script:ProjectRoot "yami-shop-api/target/yami-shop-api-0.0.1-SNAPSHOT.jar"
             if (-not (Test-Path $jarFile)) {
                 Write-LogDirect -Message "JAR not found: $jarFile" -Level "ERROR"
                 Set-StepDirect -Id 5 -Status "failed" -Text "JAR not found"
-                Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1; return
+                Enable-Buttons -Start $true -End $false; Stop-StepTimer; $script:Step = -1; return
             }
             $logFile = "$env:TEMP\mall4j-api.log"
             $javaArgs = @("-jar", "-Dspring.profiles.active=dev", "-Dspring.datasource.username=$($script:StepUser)", "-Dspring.datasource.password=$($script:StepPass)", "-Xms512m", "-Xmx512m", "`"$jarFile`"")
@@ -1136,7 +1385,7 @@ function Process-Step {
             if (-not $p) {
                 Write-LogDirect -Message "Failed to start api process" -Level "ERROR"
                 Set-StepDirect -Id 5 -Status "failed" -Text "Launch failed"
-                Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1; return
+                Enable-Buttons -Start $true -End $false; Stop-StepTimer; $script:Step = -1; return
             }
             Write-LogDirect -Message "Api process started (PID $($p.Id)), waiting for port 8086..." -Level "INFO"
             $script:ApiPid = $p.Id
@@ -1152,7 +1401,7 @@ function Process-Step {
         }
         9 {  # Start mall4v frontend
             Set-StepDirect -Id 6 -Status "running" -Text "Starting..."
-            Set-Status -Text "Starting mall4v frontend..." -Color "#07C160"
+            Set-Status -Text "Starting mall4v frontend..." -Color "#2216ff"
             Write-LogDirect -Message "Starting mall4v (port 9527)..." -Level "INFO"
             $dir = Join-Path $script:ProjectRoot "front-end/mall4v"
             if (-not (Test-Path (Join-Path $dir "node_modules"))) {
@@ -1163,7 +1412,7 @@ function Process-Step {
                     Set-StepDirect -Id 6 -Status "failed" -Text "Install failed"; $script:Step = -1; return
                 }
             }
-            $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c pnpm dev" -WorkingDirectory $dir -NoNewWindow -PassThru
+            $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c pnpm dev 2>nul" -WorkingDirectory $dir -NoNewWindow -PassThru
             if (-not $p) {
                 Write-LogDirect -Message "Failed to start mall4v" -Level "ERROR"
                 Set-StepDirect -Id 6 -Status "failed" -Text "Launch failed"; $script:Step = -1; return
@@ -1181,7 +1430,7 @@ function Process-Step {
         }
         11 {  # Start mall4uni frontend
             Set-StepDirect -Id 7 -Status "running" -Text "Starting..."
-            Set-Status -Text "Starting mall4uni frontend..." -Color "#07C160"
+            Set-Status -Text "Starting mall4uni frontend..." -Color "#2216ff"
             Write-LogDirect -Message "Starting mall4uni (port 5173)..." -Level "INFO"
             $dir = Join-Path $script:ProjectRoot "front-end/mall4uni"
             if (-not (Test-Path (Join-Path $dir "node_modules"))) {
@@ -1192,7 +1441,7 @@ function Process-Step {
                     Set-StepDirect -Id 7 -Status "failed" -Text "Install failed"; $script:Step = -1; return
                 }
             }
-            $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c npm run dev" -WorkingDirectory $dir -NoNewWindow -PassThru
+            $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c npm run dev" -WorkingDirectory $dir -WindowStyle Hidden -PassThru
             if (-not $p) {
                 Write-LogDirect -Message "Failed to start mall4uni" -Level "ERROR"
                 Set-StepDirect -Id 7 -Status "failed" -Text "Launch failed"; $script:Step = -1; return
@@ -1217,8 +1466,8 @@ function Process-Step {
             Write-LogDirect -Message "  Admin: http://localhost:9527 (admin/123456)" -Level "SUCCESS"
             Write-LogDirect -Message "  Shop:  http://localhost:5173" -Level "SUCCESS"
             Write-LogDirect -Message "==========================================" -Level "SUCCESS"
-            Set-Status -Text "All services started!" -Color "#07C160"
-            Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1
+            Set-Status -Text "All services started!" -Color "#2216ff"
+            Enable-Buttons -Start $false -End $true; Stop-StepTimer; $script:Step = -1
             Show-TransparentPopup
         }
     }
@@ -1342,31 +1591,33 @@ $ui.btnStart.Add_Click({
     }
     Update-StepUI
     $ui.txtLog.Clear()
-    Enable-Buttons -Start $false -Stop $true
-    Set-Status -Text "Starting..." -Color "#07C160"
+    Enable-Buttons -Start $false -End $true
+    Set-Status -Text "Starting..." -Color "#2216ff"
     Write-LogDirect -Message "Starting Mall4j..." -Level "INFO"
 
     $script:Step = 0
     Start-StepTimer
 })
 
-# Stop button
-$ui.btnStop.Add_Click({
+# END button — 全面关闭 + 释放端口
+$ui.btnEnd.Add_Click({
     Stop-StepTimer
     $script:Step = -1
-    Enable-Buttons -Start $false -Stop $false
-    Set-Status -Text "Stopping..." -Color "#FA5151"
-    Write-LogDirect -Message "Stopping all services..." -Level "WARN"
-    Stop-AllServices -LogCallback { param($m) Write-LogDirect -Message $m -Level "WARN" }
+    Enable-Buttons -Start $false -End $false
+    Set-Status -Text "Ending..." -Color "#FA5151"
+    Write-LogDirect -Message "====== 全面关闭开始 ======" -Level "WARN"
+    Stop-AndReleaseAll -LogCallback { param($m) Write-LogDirect -Message $m -Level "WARN" }
     foreach ($step in $script:Steps) {
         $step.Status = "pending"; $step.StatusText = "Pending"
         $step.StatusColor = "#DDDDDD"; $step.StatusIcon = "o"
         try { $step.StatusTextColor = "#999999" } catch {}
     }
     Update-StepUI
-    Enable-Buttons -Start $true -Stop $false
-    Set-Status -Text "Stopped" -Color "#999999"
-    Write-LogDirect -Message "All services stopped" -Level "SUCCESS"
+    Enable-Buttons -Start $true -End $false
+    Set-Status -Text "Ready" -Color "#2216ff"
+    Write-LogDirect -Message "====== 全面关闭完成，环境已重置 ======" -Level "SUCCESS"
+    Write-Host "//已终结商城程序，完成端口的释放" -ForegroundColor Cyan
+    Write-LogDirect -Message "//已终结商城程序，完成端口的释放" -Level "SUCCESS"
 })
 
 #=============================================
@@ -1413,6 +1664,59 @@ try {
     Write-Log -Message "Environment check done" -Level "INFO"
 } catch {
     Write-Log -Message "Environment check failed: $_" -Level "WARN"
+}
+
+# ===== Auto-detect running services =====
+Write-Log -Message "Scanning for running services..." -Level "INFO"
+$detectedPorts = @{}
+foreach ($port in @(6379, 8085, 8086, 9527, 5173)) {
+    $check = Check-Port -Port $port
+    $detectedPorts[$port] = $check.InUse
+    $status = if ($check.InUse) { "BUSY" } else { "free" }
+    Write-Log -Message ("  Port " + $port + " -> " + $status) -Level "INFO"
+}
+
+$anyRunning = $false
+foreach ($v in $detectedPorts.Values) { if ($v) { $anyRunning = $true; break } }
+
+if ($anyRunning) {
+    Write-Log -Message "Detected running services, updating panel..." -Level "SUCCESS"
+
+    # Backend running → env, DB, Redis, build were all done
+    if ($detectedPorts[8085] -or $detectedPorts[8086]) {
+        Set-StepDirect -Id 0 -Status "completed" -Text "Done"
+        Set-StepDirect -Id 1 -Status "completed" -Text "Connected"
+        Set-StepDirect -Id 3 -Status "completed" -Text "Done"
+    }
+    # Redis
+    if ($detectedPorts[6379]) {
+        Set-StepDirect -Id 2 -Status "completed" -Text "Running"
+    }
+    # Admin
+    if ($detectedPorts[8085]) {
+        Set-StepDirect -Id 4 -Status "completed" -Text "Running"
+    }
+    # API
+    if ($detectedPorts[8086]) {
+        Set-StepDirect -Id 5 -Status "completed" -Text "Running"
+    }
+    # mall4v
+    if ($detectedPorts[9527]) {
+        Set-StepDirect -Id 6 -Status "completed" -Text "Running"
+    }
+    # mall4uni
+    if ($detectedPorts[5173]) {
+        Set-StepDirect -Id 7 -Status "completed" -Text "Running"
+    }
+
+    # Button states: End enabled (can stop), Start enabled (can start missing services)
+    $window.Dispatcher.Invoke([Action]{
+        $ui.btnEnd.IsEnabled = $true
+    }, "Normal")
+    Set-Status -Text "Some services already running" -Color "#FFC300"
+    Write-Log -Message "//已检测到运行中的服务，End 按钮已启用" -Level "SUCCESS"
+} else {
+    Write-Log -Message "No running services detected" -Level "INFO"
 }
 
 # Init step panel

@@ -1,3 +1,0 @@
- 确保下面着两个路径的文件都能够被EXE传参
- yami-shop-admin/src/main/resources/application-dev.yml
- yami-shop-api/src/main/resources/application-dev.yml
