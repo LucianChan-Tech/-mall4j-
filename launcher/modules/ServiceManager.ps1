@@ -2,6 +2,88 @@
 
 $script:ServiceJobs = @{}
 
+# ===== Docker Desktop 辅助函数 =====
+
+function Start-DockerDesktop {
+    <#
+    .SYNOPSIS
+        尝试启动 Docker Desktop（若未运行）
+    #>
+    $dockerCheck = & docker info 2>&1
+    if ("$dockerCheck" -match '(?i)(Server Version|Containers:)') {
+        return $true
+    }
+
+    $knownPaths = @(
+        "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe",
+        "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe",
+        "${env:ProgramFiles(x86)}\Docker\Docker\Docker Desktop.exe",
+        "$env:LOCALAPPDATA\Docker\Docker Desktop.exe",
+        "$env:ProgramW6432\Docker\Docker\Docker Desktop.exe"
+    )
+
+    $dockerExe = $null
+    foreach ($p in $knownPaths) {
+        if (Test-Path $p) { $dockerExe = $p; break }
+    }
+
+    # 如果没找到已知路径，尝试从快捷方式查找
+    if (-not $dockerExe) {
+        $startMenu = [Environment]::GetFolderPath('CommonStartMenu')
+        $shortcut = Get-ChildItem -Path "$startMenu\*" -Recurse -Include "Docker Desktop.lnk" -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+        if ($shortcut) { $dockerExe = $shortcut.FullName }
+    }
+
+    # 最后的办法: 尝试 which docker 路径推断
+    if (-not $dockerExe -and (Get-Command docker -ErrorAction SilentlyContinue)) {
+        $dockerCmd = (Get-Command docker).Source
+        $dockerExe = Join-Path (Split-Path $dockerCmd -Parent) "Docker Desktop.exe"
+        if (-not (Test-Path $dockerExe)) { $dockerExe = $null }
+    }
+
+    if (-not $dockerExe) { return $false }
+
+    Write-LauncherLog -Message "Starting Docker Desktop from: $dockerExe" -Level "INFO"
+    try {
+        $proc = Start-Process -FilePath $dockerExe -WindowStyle Hidden -PassThru
+        # 不等进程退出（Docker Desktop 会保持运行）
+        return $true
+    } catch {
+        Write-LauncherLog -Message "Failed to start Docker Desktop: $_" -Level "WARN"
+        return $false
+    }
+}
+
+function Wait-ForDockerDaemon {
+    <#
+    .SYNOPSIS
+        等待 Docker 守护进程可用，最多等 timeoutSeconds 秒
+    #>
+    param([int]$TimeoutSeconds = 60)
+
+    $startTime = Get-Date
+    while ((Get-Date) -lt $startTime.AddSeconds($TimeoutSeconds)) {
+        $dockerCheck = & docker info 2>&1
+        if ("$dockerCheck" -match '(?i)(Server Version|Containers:)') {
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
+# ===== 兼容性端口检查（不依赖 "LISTENING" 英文关键词） =====
+
+function Test-PortListening {
+    param([int]$Port)
+    # netstat -an 用数字格式，不依赖语言
+    $lines = netstat -an 2>&1 | Select-String ":$Port\s" | Select-String "LISTEN|听|ESCUCH|ECOUTE|LAUSCHE"
+    return [bool]$lines
+}
+
+# ===== 原有函数 =====
+
 function Wait-ForPort {
     param([int]$Port, [int]$TimeoutSeconds = 60)
     $startTime = Get-Date
@@ -18,45 +100,96 @@ function Start-RedisService {
     if (-not $LogCallback) { $LogCallback = { param($m) } }
     $result = @{ Success = $false; Message = "" }
 
+    # 1. 先检查端口是否已被占用
     $portCheck = Check-Port -Port 6379
     if ($portCheck.InUse) {
         $result.Success = $true
         $result.Message = "Redis already running (port 6379)"
+        & $LogCallback "Redis already running (port 6379)"
         return $result
     }
 
-    try {
-        & $LogCallback "Starting Redis (Docker)..."
+    # 2. 检查 docker 命令是否存在
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        $result.Message = "Docker command not found. Please install Docker Desktop first."
+        & $LogCallback "Docker command not found. Please install Docker Desktop first."
+        return $result
+    }
+
+    # 3. 检查 Docker 是否在运行，不在则尝试启动
+    $dockerCheck = & docker info 2>&1
+    $dockerOk = "$dockerCheck" -match '(?i)(Server Version|Containers:)'
+
+    if (-not $dockerOk) {
+        & $LogCallback "Docker Desktop not running, attempting to start..."
+        $started = Start-DockerDesktop
+        if ($started) {
+            & $LogCallback "Docker Desktop launch initiated, waiting for daemon..."
+            $waited = Wait-ForDockerDaemon -TimeoutSeconds 60
+            if (-not $waited) {
+                $result.Message = "Docker Desktop did not become ready within 60s"
+                & $LogCallback "Docker Desktop did not become ready within 60s"
+                return $result
+            }
+            & $LogCallback "Docker Desktop is now ready"
+        } else {
+            & $LogCallback "Could not find Docker Desktop executable."
+            $result.Message = "Docker Desktop not found. Please start it manually."
+            return $result
+        }
+    }
+
+    # 4. 尝试启动 Redis（含重试）
+    & $LogCallback "Starting Redis (Docker)..."
+
+    $maxRetries = 3
+    $attempt = 0
+    while ($attempt -lt $maxRetries) {
+        $attempt++
+        & $LogCallback "  Attempt $attempt/$maxRetries..."
+
+        # 清理旧容器
         & docker rm -f yami-redis 2>&1 | Out-Null
-        $proc = Start-Process -FilePath "docker" -ArgumentList "run -d --name yami-redis -p 6379:6379 redis:5.0.4" `
-            -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\redis_start.log" -RedirectStandardError "$env:TEMP\redis_start_err.log"
-        if (-not $proc) {
-            & $LogCallback "Redis: failed to create docker process"
-            $result.Message = "Failed to create docker process"
-            return $result
-        }
-        $proc.WaitForExit(15000)
 
-        if ($proc.ExitCode -ne 0) {
-            $errMsg = Get-Content "$env:TEMP\redis_start_err.log" -Raw -ErrorAction SilentlyContinue
-            & $LogCallback "Redis start failed: $errMsg"
-            $result.Message = "Redis start failed"
-            return $result
+        # 拉取镜像（后台静默拉取，更快）
+        & docker pull redis:5.0.4 2>&1 | Out-Null
+
+        # 启动容器
+        & docker run -d --name yami-redis -p 6379:6379 redis:5.0.4 2>&1 | Out-Null
+
+        # 轮询等待端口就绪（最多 20 秒）
+        $waitStart = Get-Date
+        $portReady = $false
+        while ((Get-Date) -lt $waitStart.AddSeconds(20)) {
+            $check = Test-PortListening -Port 6379
+            if ($check) {
+                $portReady = $true
+                break
+            }
+            Start-Sleep -Milliseconds 1000
         }
 
-        $waitOk = Wait-ForPort -Port 6379 -TimeoutSeconds 15
-        if ($waitOk) {
+        if ($portReady) {
             $result.Success = $true
             $result.Message = "Redis started"
             & $LogCallback "Redis started (127.0.0.1:6379)"
-        } else {
-            $result.Message = "Redis port not listening"
-            & $LogCallback "Redis start timeout"
+            return $result
         }
-    } catch {
-        $result.Message = "Redis error: $_"
-        & $LogCallback "Redis error: $_"
+
+        if ($attempt -lt $maxRetries) {
+            & $LogCallback "  Port 6379 not ready, retrying..."
+            & docker rm -f yami-redis 2>&1 | Out-Null
+            Start-Sleep -Seconds 2
+        }
     }
+
+    # 5. 重试用尽后检查 Docker 容器状态
+    $inspect = & docker inspect yami-redis --format '{{.State.Status}}' 2>&1
+    & $LogCallback "Redis container status: $inspect"
+
+    $result.Message = "Redis failed to start after $maxRetries attempts"
+    & $LogCallback "Redis failed to start. Check Docker Desktop and try manually:"
+    & $LogCallback "  docker run -d --name yami-redis -p 6379:6379 redis:5.0.4"
     return $result
 }
 

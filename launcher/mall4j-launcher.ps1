@@ -365,17 +365,19 @@ function Process-Step {
                 Set-StepDirect -Id 2 -Status "completed" -Text "Already running"
                 $script:Step = 3
             } else {
-                Write-LogDirect -Message "Starting Redis (Docker)..." -Level "INFO"
+                Write-LogDirect -Message "Starting Redis..." -Level "INFO"
+                # 加载模块函数路径（供后台 job 使用）
+                $modulesDir = $script:ModulesDir
+                $logCbLocal = $logCb
                 $script:StepJob = Start-Job -Name "step-redis" -ScriptBlock {
-                    param($cb) function l { param($m) & $cb $m }
-                    $r = docker rm -f yami-redis 2>&1 | Out-Null
-                    $p = Start-Process -FilePath "docker" -ArgumentList "run -d --name yami-redis -p 6379:6379 redis:5.0.4" -NoNewWindow -PassThru
-                    if (-not $p) { return "FAILED" }
-                    $p.WaitForExit(20000)
-                    start-sleep 3
-                    $check = netstat -ano | Select-String LISTENING | Select-String ":6379 "
-                    if ($check) { return "OK" } else { return "FAILED" }
-                } -ArgumentList $logCb
+                    param($modDir, $cb)
+                    # 在 job 中重新加载模块
+                    . (Join-Path $modDir "EnvCheck.ps1")
+                    . (Join-Path $modDir "ServiceManager.ps1")
+                    $result = Start-RedisService -LogCallback $cb
+                    if ($result.Success) { return "OK" } else { return "FAILED:$($result.Message)" }
+                } -ArgumentList $modulesDir, $logCbLocal
+                Write-LogDirect -Message "Redis startup initiated, waiting..." -Level "INFO"
             }
         }
         3 {  # Build backend - start the build

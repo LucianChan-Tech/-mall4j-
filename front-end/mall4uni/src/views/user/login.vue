@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useUserStore } from '@/stores/user'
+import { encrypt } from '@/utils/crypto'
 
 const router = useRouter()
 const route = useRoute()
@@ -23,7 +24,7 @@ async function doLogin() {
   try {
     await userStore.login({
       userName: username.value.trim(),
-      passWord: password.value.trim()
+      passWord: encrypt(password.value.trim())
     })
     // 跳回登录前页面
     const redirect = sessionStorage.getItem('redirectAfterLogin') || '/'

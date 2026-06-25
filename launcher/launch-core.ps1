@@ -133,8 +133,8 @@ try {
     Set-StepUI -Id 2 -Status "running" -Text "Starting..."
     try {
         $redisPortCheck = Check-Port -Port 6379
-        if ($redisPortCheck.InUse -and $redisPortCheck.ProcessName -eq "docker") {
-            Write-LogUI -Message "Redis already running" -Level "SUCCESS"
+        if ($redisPortCheck.InUse) {
+            Write-LogUI -Message "Redis already running (port 6379)" -Level "SUCCESS"
             Set-StepUI -Id 2 -Status "completed" -Text "Already running"
         } else {
             $redisResult = Start-RedisService -LogCallback $logCb

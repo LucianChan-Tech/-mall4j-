@@ -7,7 +7,7 @@ export const userApi = {
   },
   // 注册
   register(data) {
-    return http.post('/register', data)
+    return http.post('/user/register', data)
   },
   // 刷新 token
   refresh() {

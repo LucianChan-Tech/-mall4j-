@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
+import { encrypt } from '@/utils/crypto'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -32,12 +33,12 @@ async function doRegister() {
   try {
     await userStore.register({
       userName: username.value.trim(),
-      passWord: password.value.trim()
+      passWord: encrypt(password.value.trim())
     })
     // 注册成功后自动登录
     await userStore.login({
       userName: username.value.trim(),
-      passWord: password.value.trim()
+      passWord: encrypt(password.value.trim())
     })
     router.push('/')
   } catch (err) {

@@ -108,7 +108,9 @@ function Check-Port {
     param([int]$Port)
     $result = @{ InUse = $false; ProcessName = $null; Pid = $null }
     try {
-        $conn = netstat -ano | Select-String "LISTENING" | Select-String ":$Port "
+        # 使用 netstat -an（数字端口，不依赖语言）配合 (LISTEN|听|ESCUCH)
+        $lines = netstat -ano | Select-String ":$Port\s" | Select-String "LISTEN|听.*$|ESCUCH|ECOUTE|LAUSCHE"
+        $conn = $lines | Select-Object -First 1
         if ($conn) {
             $result.InUse = $true
             $line = $conn.Line -split '\s+'
