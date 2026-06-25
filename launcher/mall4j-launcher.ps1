@@ -539,6 +539,64 @@ function Test-JarsExist {
     return @{ AdminExists = $adminExists; ApiExists = $apiExists; AllExist = ($adminExists -and $apiExists) }
 }
 
+function Install-LocalMaven {
+    param([scriptblock]$LogCallback)
+    if (-not $LogCallback) { $LogCallback = { param($m) } }
+    $mavenRoot = Join-Path $env:APPDATA "Mall4jLauncher\maven"
+    $mvnExe = Join-Path $mavenRoot "bin\mvn.cmd"
+    if (Test-Path $mvnExe) {
+        & $LogCallback "Local Maven found: $mvnExe"
+        return $mvnExe
+    }
+    $version = "3.9.9"
+    $zipUrl = "https://dlcdn.apache.org/maven/maven-3/$version/binaries/apache-maven-$version-bin.zip"
+    $zipPath = "$env:TEMP\apache-maven-$version-bin.zip"
+    & $LogCallback "Downloading Maven $version from Apache (may take a while)..."
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $wc = New-Object System.Net.WebClient
+        & $LogCallback "  Downloading: $zipUrl"
+        $wc.DownloadFile($zipUrl, $zipPath)
+        $wc.Dispose()
+    } catch {
+        & $LogCallback "Primary mirror failed, trying backup..." -Level "WARN"
+        try {
+            $wc = New-Object System.Net.WebClient
+            $wc.DownloadFile("https://archive.apache.org/dist/maven/maven-3/$version/binaries/apache-maven-$version-bin.zip", $zipPath)
+            $wc.Dispose()
+        } catch {
+            & $LogCallback "Download failed: $_" -Level "ERROR"
+            return $null
+        }
+    }
+    & $LogCallback "Extracting Maven..."
+    try {
+        $tempExtract = "$env:TEMP\maven-extract"
+        Expand-Archive -Path $zipPath -DestinationPath $tempExtract -Force
+        $extracted = Join-Path $tempExtract "apache-maven-$version"
+        if (-not (Test-Path $extracted)) {
+            # 某些版本压缩包目录名可能不同
+            $extracted = Get-ChildItem $tempExtract -Directory | Select-Object -First 1 -ExpandProperty FullName
+        }
+        if (-not (Test-Path $mavenRoot)) { New-Item -ItemType Directory -Path $mavenRoot -Force | Out-Null }
+        Move-Item -Path "$extracted\*" -Destination $mavenRoot -Force
+        Remove-Item -Path $tempExtract -Recurse -Force
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+    } catch {
+        & $LogCallback "Extraction failed: $_" -Level "ERROR"
+        return $null
+    }
+    if (Test-Path $mvnExe) {
+        & $LogCallback "Maven installed locally: $mvnExe" -Level "SUCCESS"
+        return $mvnExe
+    }
+    # 可能是 mvn (无 .cmd) 的情况
+    $mvnExe2 = Join-Path $mavenRoot "bin\mvn"
+    if (Test-Path $mvnExe2) { return $mvnExe2 }
+    & $LogCallback "Maven install failed: $mvnExe not found" -Level "ERROR"
+    return $null
+}
+
 function Invoke-MavenBuild {
     param([string]$ProjectRoot, [string]$Module = "", [scriptblock]$LogCallback, [int]$TimeoutSeconds = 300)
     if (-not $LogCallback) { $LogCallback = { param($m) } }
@@ -985,48 +1043,34 @@ function Process-Step {
                 $script:Step = 5
                 return
             }
-            # JAR 不存在，检查 Maven 是否可用
-            $mvnCheck = Check-Maven
-            if (-not $mvnCheck.Ok) {
-                Write-LogDirect -Message "Maven not installed and no pre-built JARs found" -Level "ERROR"
-                Set-StepDirect -Id 3 -Status "failed" -Text "Maven not found"
-                Set-Status -Text "Maven not installed" -Color "#FA5151"
-                $msg = @"
-[缺少 Maven 构建工具]
-
-检测到本机未安装 Maven，且缺少预编译的 JAR 文件。
-
-请选择以下方式之一启动：
-
-  ▸ 方案A：安装 Maven
-    以管理员身份打开终端，执行：
-      winget install Apache.Maven
-    安装后重新启动本程序
-
-  ▸ 方案B：使用预编译 JAR（无需 Maven）
-    将有 Maven 环境的机器上编译好的 JAR 复制到：
-      yami-shop-admin\target\yami-shop-admin-0.0.1-SNAPSHOT.jar
-      yami-shop-api\target\yami-shop-api-0.0.1-SNAPSHOT.jar
-    然后重新启动本程序
-"@
-                [System.Windows.MessageBox]::Show($msg, "Mall4j Launcher - Maven 未安装", "OK", "Warning")
+            # JAR 不存在，自动下载 Maven
+            Write-LogDirect -Message "Maven not found, downloading locally..." -Level "INFO"
+            Set-StepDirect -Id 3 -Status "running" -Text "Downloading Maven..."
+            Set-Status -Text "Downloading Maven (~1 min)..." -Color "#FFC300"
+            $mvnPath = Install-LocalMaven -LogCallback { param($m) Write-LogDirect -Message $m -Level "INFO" }
+            if (-not $mvnPath) {
+                Write-LogDirect -Message "Failed to download Maven. Check internet connection." -Level "ERROR"
+                Write-LogDirect -Message "Alternatively, copy pre-built JARs to target/ directories." -Level "INFO"
+                Set-StepDirect -Id 3 -Status "failed" -Text "Download failed"
+                Set-Status -Text "Maven download failed" -Color "#FA5151"
                 Enable-Buttons -Start $true -Stop $false
                 Stop-StepTimer
                 $script:Step = -1
                 return
             }
+            Write-LogDirect -Message "Maven ready: $mvnPath" -Level "SUCCESS"
             Set-StepDirect -Id 3 -Status "running" -Text "Building..."
             Set-Status -Text "Building backend (~1-3 min)..." -Color "#FFC300"
             Write-LogDirect -Message "Building backend..." -Level "INFO"
             $script:StepBuildResult = $null
             $script:StepJob = Start-Job -Name "step-build" -ScriptBlock {
-                param($root)
+                param($root, $mvn)
                 $logFile = "$env:TEMP\mall4j_build.log"
-                $p = Start-Process -FilePath "mvn" -ArgumentList "clean package -DskipTests" -NoNewWindow -PassThru -WorkingDirectory $root -RedirectStandardOutput $logFile -RedirectStandardError "${logFile}.err"
+                $p = Start-Process -FilePath $mvn -ArgumentList "clean package -DskipTests" -NoNewWindow -PassThru -WorkingDirectory $root -RedirectStandardOutput $logFile -RedirectStandardError "${logFile}.err"
                 if (-not $p) { return "FAILED" }
                 $p.WaitForExit(300000)
                 if ($p.ExitCode -eq 0) { return "OK" } else { return "FAILED" }
-            } -ArgumentList $script:ProjectRoot
+            } -ArgumentList $script:ProjectRoot, $mvnPath
             $script:Step = 4
             Write-LogDirect -Message "Maven build started, waiting for completion..." -Level "INFO"
         }
