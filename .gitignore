@@ -66,3 +66,7 @@ mall4j-mysql/
 
 ### documents ###
 documents/ 
+
+## MySql Password ##
+yami-shop-api\src\main\resources\application-dev.yml
+yami-shop-admin\src\main\resources\application-dev.yml
