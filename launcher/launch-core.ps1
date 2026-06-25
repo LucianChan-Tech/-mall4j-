@@ -32,6 +32,7 @@ function Start-DockerDesktop { $dockerCheck = & docker info 2>&1; if ("$dockerCh
 function Wait-ForDockerDaemon { param([int]$TimeoutSeconds=60) $startTime=Get-Date; while((Get-Date)-lt $startTime.AddSeconds($TimeoutSeconds)) { $dockerCheck = & docker info 2>&1; if ("$dockerCheck" -match '(?i)(Server Version|Containers:)') { return $true }; Start-Sleep -Seconds 2 }; return $false }
 function Test-PortListening { param([int]$Port) $lines = netstat -an 2>&1 | Select-String ":$Port\s" | Select-String "LISTEN|听|ESCUCH|ECOUTE|LAUSCHE"; return [bool]$lines }
 function Start-RedisService { param([scriptblock]$LogCallback) if (-not $LogCallback) { $LogCallback = { param($m) } }; $result = @{ Success=$false; Message="" }; $portCheck=Check-Port -Port 6379; if ($portCheck.InUse) { $result.Success=$true; $result.Message="Redis already running (port 6379)"; & $LogCallback "Redis already running (port 6379)"; return $result }; if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { $result.Message = "Docker command not found."; & $LogCallback "Docker command not found."; return $result }; $dockerCheck = & docker info 2>&1; $dockerOk = "$dockerCheck" -match '(?i)(Server Version|Containers:)'; if (-not $dockerOk) { & $LogCallback "Docker Desktop not running, attempting to start..."; $started = Start-DockerDesktop; if ($started) { & $LogCallback "Docker Desktop launch initiated, waiting..."; $waited = Wait-ForDockerDaemon -TimeoutSeconds 60; if (-not $waited) { $result.Message = "Docker Desktop not ready within 60s"; & $LogCallback "Docker Desktop not ready within 60s"; return $result }; & $LogCallback "Docker Desktop is ready" } else { & $LogCallback "Could not find Docker Desktop."; $result.Message = "Docker Desktop not found."; return $result } }; & $LogCallback "Starting Redis (Docker)..."; $maxRetries=3; $attempt=0; while($attempt -lt $maxRetries) { $attempt++; & $LogCallback "  Attempt $attempt/$maxRetries..."; & docker rm -f yami-redis 2>&1 | Out-Null; & docker pull redis:5.0.4 2>&1 | Out-Null; & docker run -d --name yami-redis -p 6379:6379 redis:5.0.4 2>&1 | Out-Null; $waitStart=Get-Date; $portReady=$false; while((Get-Date)-lt $waitStart.AddSeconds(20)) { if(Test-PortListening -Port 6379){$portReady=$true;break}; Start-Sleep -Milliseconds 1000 }; if($portReady){$result.Success=$true;$result.Message="Redis started";& $LogCallback "Redis started (127.0.0.1:6379)";return $result}; if($attempt -lt $maxRetries){& $LogCallback "  Retrying...";& docker rm -f yami-redis 2>&1|Out-Null;Start-Sleep -Seconds 2} }; $inspect = & docker inspect yami-redis --format '{{.State.Status}}' 2>&1; & $LogCallback "Container status: $inspect"; $result.Message = "Redis failed after $maxRetries attempts"; & $LogCallback "Redis failed. Try manually: docker run -d --name yami-redis -p 6379:6379 redis:5.0.4"; return $result }
+function Test-JarsExist { param([string]$ProjectRoot) $adminJar=Join-Path $ProjectRoot "yami-shop-admin/target/yami-shop-admin-0.0.1-SNAPSHOT.jar"; $apiJar=Join-Path $ProjectRoot "yami-shop-api/target/yami-shop-api-0.0.1-SNAPSHOT.jar"; return @{AllExist=((Test-Path $adminJar)-and(Test-Path $apiJar))} }
 function Invoke-MavenBuild { param([string]$ProjectRoot,[string]$Module="",[scriptblock]$LogCallback,[int]$TimeoutSeconds=300) if(-not $LogCallback){$LogCallback={param($m)}}; $result=@{Success=$false;Message="";Duration=0}; $mvnArgs=@("clean","package","-DskipTests"); if($Module){$mvnArgs=@("clean","package","-pl","yami-shop-$Module","-am","-DskipTests")}; $moduleLabel=if($Module){$Module}else{"all modules"}; & $LogCallback "Building backend ($moduleLabel)..."; & $LogCallback "  mvn $($mvnArgs -join ' ')"; $startTime=Get-Date;$logFile="$env:TEMP\mall4j_maven_build.log"; try{$proc=Start-Process -FilePath "mvn" -ArgumentList $mvnArgs -NoNewWindow -PassThru -WorkingDirectory $ProjectRoot -RedirectStandardOutput $logFile -RedirectStandardError "${logFile}.err";$proc.WaitForExit($TimeoutSeconds*1000);$duration=[int]((Get-Date)-$startTime).TotalSeconds;$result.Duration=$duration;if($proc.ExitCode -eq 0){$result.Success=$true;$result.Message="Build OK (${duration}s)";& $LogCallback "Build OK (${duration}s)"}else{& $LogCallback "Build FAILED";Get-Content $logFile -Tail 10 -ErrorAction SilentlyContinue|ForEach-Object{& $LogCallback "  $_"};$result.Message="Build failed"}}catch{$result.Message="Build error: $_";& $LogCallback "Build error: $_"}; return $result }
 function Start-BackendService { param([ValidateSet("admin","api")][string]$ServiceName,[string]$ProjectRoot,[string]$MysqlUser,[string]$MysqlPass,[scriptblock]$LogCallback,[int]$TimeoutSeconds=90) if(-not $LogCallback){$LogCallback={param($m)}}; $result=@{Success=$false;Message="";Process=$null}; $port=if($ServiceName -eq "admin"){8085}else{8086}; $jarDir=Join-Path $ProjectRoot "yami-shop-$ServiceName/target"; $jarFile=Join-Path $jarDir "yami-shop-$ServiceName-0.0.1-SNAPSHOT.jar"; $portCheck=Check-Port -Port $port; if($portCheck.InUse){if($portCheck.ProcessName -eq "java"){$result.Success=$true;$result.Message="$ServiceName already running (port $port)";& $LogCallback "$ServiceName already running (port $port)";return $result}else{$result.Message="Port $port in use by $($portCheck.ProcessName)";& $LogCallback "Port $port in use by $($portCheck.ProcessName)";return $result}}; if(-not (Test-Path $jarFile)){$result.Message="JAR not found: $jarFile";& $LogCallback "JAR not found: $jarFile. Build first.";return $result}; & $LogCallback "Starting $ServiceName backend (port $port)..."; try{$jobName="mall4j-$ServiceName"; $jobScript={param($JarPath,$Port,$MysqlUser,$MysqlPass)$logFile=Join-Path $env:TEMP "mall4j-$Port.log";$p=Start-Process -FilePath "java" -ArgumentList @("-jar","-Dspring.profiles.active=dev","-Dspring.datasource.username=$MysqlUser","-Dspring.datasource.password=$MysqlPass","-Xms512m","-Xmx512m","`"$JarPath`"") -NoNewWindow -PassThru -RedirectStandardOutput $logFile -RedirectStandardError $logFile;$p.WaitForExit()}; $job=Start-Job -Name $jobName -ScriptBlock $jobScript -ArgumentList $jarFile,$port,$MysqlUser,$MysqlPass; $script:ServiceJobs[$ServiceName]=$job; & $LogCallback "Waiting for $ServiceName (max ${TimeoutSeconds}s)..."; $waitOk=Wait-ForPort -Port $port -TimeoutSeconds $TimeoutSeconds; if($waitOk){$result.Success=$true;$result.Message="$ServiceName started";& $LogCallback "$ServiceName started (port $port)"}else{$result.Message="$ServiceName start timeout";& $LogCallback "$ServiceName start timeout"}}catch{$result.Message="$ServiceName error: $_";& $LogCallback "$ServiceName error: $_"}; return $result }
 function Start-FrontendService { param([ValidateSet("mall4v","mall4uni")][string]$FrontendName,[string]$ProjectRoot,[scriptblock]$LogCallback,[int]$TimeoutSeconds=120) if(-not $LogCallback){$LogCallback={param($m)}}; $result=@{Success=$false;Message="";Port=0}; $frontendDir=Join-Path $ProjectRoot "front-end/$FrontendName"; $port=if($FrontendName -eq "mall4v"){9527}else{5173}; $pkgMgr=if($FrontendName -eq "mall4v"){"pnpm"}else{"npm"}; $portCheck=Check-Port -Port $port; if($portCheck.InUse){$result.Success=$true;$result.Port=$port;$result.Message="$FrontendName already running (port $port)";& $LogCallback "$FrontendName already running (port $port)";return $result}; if(-not (Test-Path $frontendDir)){$result.Message="Directory not found: $frontendDir";& $LogCallback "Directory not found: front-end/$FrontendName";return $result}; $nodeModules=Join-Path $frontendDir "node_modules"; if(-not (Test-Path $nodeModules)){& $LogCallback "Installing $FrontendName dependencies..."; try{$installProc=Start-Process -FilePath $pkgMgr -ArgumentList "--prefix",$frontendDir,"install" -NoNewWindow -PassThru -Wait -RedirectStandardOutput "$env:TEMP\${FrontendName}_install.log" -RedirectStandardError "$env:TEMP\${FrontendName}_install_err.log"; if($installProc.ExitCode -ne 0){$result.Message="Dependency install failed";& $LogCallback "Dependency install failed for $FrontendName";return $result}; & $LogCallback "Dependencies installed for $FrontendName"}catch{$result.Message="Install error: $_";& $LogCallback "Install error for ${FrontendName}: $_";return $result}}; & $LogCallback "Starting $FrontendName dev server (port $port)..."; try{$jobName="frontend-$FrontendName";$jobScript={param($Dir)Set-Location $Dir;$logFile=Join-Path $env:TEMP "mall4j-frontend.log";$p=Start-Process -FilePath "powershell" -ArgumentList "-NoProfile -Command `"$devCmd`"" -NoNewWindow -PassThru;$p.WaitForExit()}; $job=Start-Job -Name $jobName -ScriptBlock $jobScript -ArgumentList $frontendDir;$script:ServiceJobs[$jobName]=$job; $waitOk=Wait-ForPort -Port $port -TimeoutSeconds $TimeoutSeconds; if($waitOk){$result.Success=$true;$result.Port=$port;$result.Message="$FrontendName started";& $LogCallback "$FrontendName started (http://localhost:$port)"}else{$result.Message="$FrontendName start timeout";& $LogCallback "$FrontendName start timeout (${TimeoutSeconds}s)"}}catch{$result.Message="$FrontendName error: $_";& $LogCallback "$FrontendName error: $_"}; return $result }
@@ -172,26 +173,33 @@ try {
     }
 
     # ===== Step 3: Build Backend =====
-    Set-StepUI -Id 3 -Status "running" -Text "Building..."
-    Set-StatusBarUI -Text "Building backend (~1-3 min)..." -Color "#FFC300"
-    try {
-        $mavenResult = Invoke-MavenBuild -ProjectRoot $ProjectRoot -LogCallback $logCb -TimeoutSeconds 300
-    } catch {
-        Write-LogUI -Message "Step 3 error: $_" -Level "ERROR"
-        Set-StepUI -Id 3 -Status "failed" -Text "Error"
-        Set-StatusBarUI -Text "Build failed" -Color "#FA5151"
-        Enable-ButtonsUI -Start $true -Stop $false
-        throw "Abort: Build exception"
-    }
-    if ($mavenResult.Success) {
-        Write-LogUI -Message "Build successful ($($mavenResult.Duration)s)" -Level "SUCCESS"
-        Set-StepUI -Id 3 -Status "completed" -Text "Build OK"
+    # 先检查预编译 JAR 是否存在
+    $jarsExist = Test-JarsExist -ProjectRoot $ProjectRoot
+    if ($jarsExist.AllExist) {
+        Write-LogUI -Message "Pre-built JARs found, skipping Maven build" -Level "SUCCESS"
+        Set-StepUI -Id 3 -Status "completed" -Text "Skipped (JARs exist)"
     } else {
-        Write-LogUI -Message "Build failed, check code and retry" -Level "ERROR"
-        Set-StepUI -Id 3 -Status "failed" -Text "Build failed"
-        Set-StatusBarUI -Text "Build failed" -Color "#FA5151"
-        Enable-ButtonsUI -Start $true -Stop $false
-        throw "Abort: Build failed"
+        Set-StepUI -Id 3 -Status "running" -Text "Building..."
+        Set-StatusBarUI -Text "Building backend (~1-3 min)..." -Color "#FFC300"
+        try {
+            $mavenResult = Invoke-MavenBuild -ProjectRoot $ProjectRoot -LogCallback $logCb -TimeoutSeconds 300
+        } catch {
+            Write-LogUI -Message "Step 3 error: $_" -Level "ERROR"
+            Set-StepUI -Id 3 -Status "failed" -Text "Error"
+            Set-StatusBarUI -Text "Build failed" -Color "#FA5151"
+            Enable-ButtonsUI -Start $true -Stop $false
+            throw "Abort: Build exception"
+        }
+        if ($mavenResult.Success) {
+            Write-LogUI -Message "Build successful ($($mavenResult.Duration)s)" -Level "SUCCESS"
+            Set-StepUI -Id 3 -Status "completed" -Text "Build OK"
+        } else {
+            Write-LogUI -Message "Build failed, check code and retry" -Level "ERROR"
+            Set-StepUI -Id 3 -Status "failed" -Text "Build failed"
+            Set-StatusBarUI -Text "Build failed" -Color "#FA5151"
+            Enable-ButtonsUI -Start $true -Stop $false
+            throw "Abort: Build failed"
+        }
     }
 
     # ===== Step 4: Start admin Backend =====

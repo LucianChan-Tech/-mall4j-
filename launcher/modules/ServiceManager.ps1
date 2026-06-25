@@ -342,6 +342,15 @@ function Start-FrontendService {
     return $result
 }
 
+function Test-JarsExist {
+    param([string]$ProjectRoot)
+    $adminJar = Join-Path $ProjectRoot "yami-shop-admin/target/yami-shop-admin-0.0.1-SNAPSHOT.jar"
+    $apiJar   = Join-Path $ProjectRoot "yami-shop-api/target/yami-shop-api-0.0.1-SNAPSHOT.jar"
+    $adminExists = Test-Path $adminJar
+    $apiExists   = Test-Path $apiJar
+    return @{ AdminExists = $adminExists; ApiExists = $apiExists; AllExist = ($adminExists -and $apiExists) }
+}
+
 function Invoke-MavenBuild {
     param(
         [string]$ProjectRoot,

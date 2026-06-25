@@ -530,6 +530,15 @@ function Start-FrontendService {
     return $result
 }
 
+function Test-JarsExist {
+    param([string]$ProjectRoot)
+    $adminJar = Join-Path $ProjectRoot "yami-shop-admin/target/yami-shop-admin-0.0.1-SNAPSHOT.jar"
+    $apiJar   = Join-Path $ProjectRoot "yami-shop-api/target/yami-shop-api-0.0.1-SNAPSHOT.jar"
+    $adminExists = Test-Path $adminJar
+    $apiExists   = Test-Path $apiJar
+    return @{ AdminExists = $adminExists; ApiExists = $apiExists; AllExist = ($adminExists -and $apiExists) }
+}
+
 function Invoke-MavenBuild {
     param([string]$ProjectRoot, [string]$Module = "", [scriptblock]$LogCallback, [int]$TimeoutSeconds = 300)
     if (-not $LogCallback) { $LogCallback = { param($m) } }
@@ -968,6 +977,14 @@ function Process-Step {
             }
         }
         3 {  # Build backend - start the build
+            # 先检查预编译 JAR 是否存在
+            $jarsExist = Test-JarsExist -ProjectRoot $script:ProjectRoot
+            if ($jarsExist.AllExist) {
+                Write-LogDirect -Message "Pre-built JARs found, skipping Maven build" -Level "SUCCESS"
+                Set-StepDirect -Id 3 -Status "completed" -Text "Skipped (JARs exist)"
+                $script:Step = 5
+                return
+            }
             Set-StepDirect -Id 3 -Status "running" -Text "Building..."
             Set-Status -Text "Building backend (~1-3 min)..." -Color "#FFC300"
             Write-LogDirect -Message "Building backend..." -Level "INFO"
