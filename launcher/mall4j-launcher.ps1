@@ -312,15 +312,14 @@ function Save-UserConfig {
         $secureStr = ConvertTo-SecureString $Config.MysqlPass -AsPlainText -Force
         $encryptedPass = ConvertFrom-SecureString $secureStr
     }
-    $xmlContent = @"`<?xml version="1.0" encoding="utf-8"?>
+    $xmlContent = '<?xml version="1.0" encoding="utf-8"?>
 <config>
-  <mysqlUser>$($Config.MysqlUser)</mysqlUser>
-  <mysqlPassEncrypted>$encryptedPass</mysqlPassEncrypted>
-  <redisHost>$($Config.RedisHost)</redisHost>
-  <redisPort>$($Config.RedisPort)</redisPort>
+  <mysqlUser>' + $Config.MysqlUser + '</mysqlUser>
+  <mysqlPassEncrypted>' + $encryptedPass + '</mysqlPassEncrypted>
+  <redisHost>' + $Config.RedisHost + '</redisHost>
+  <redisPort>' + $Config.RedisPort + '</redisPort>
   <profile>dev</profile>
-</config>
-"@
+</config>'
     try { [System.IO.File]::WriteAllText($script:ConfigFile, $xmlContent, [System.Text.Encoding]::UTF8); return $true }
     catch { return $false }
 }
