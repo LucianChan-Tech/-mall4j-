@@ -985,6 +985,36 @@ function Process-Step {
                 $script:Step = 5
                 return
             }
+            # JAR 不存在，检查 Maven 是否可用
+            $mvnCheck = Check-Maven
+            if (-not $mvnCheck.Ok) {
+                Write-LogDirect -Message "Maven not installed and no pre-built JARs found" -Level "ERROR"
+                Set-StepDirect -Id 3 -Status "failed" -Text "Maven not found"
+                Set-Status -Text "Maven not installed" -Color "#FA5151"
+                $msg = @"
+[缺少 Maven 构建工具]
+
+检测到本机未安装 Maven，且缺少预编译的 JAR 文件。
+
+请选择以下方式之一启动：
+
+  ▸ 方案A：安装 Maven
+    以管理员身份打开终端，执行：
+      winget install Apache.Maven
+    安装后重新启动本程序
+
+  ▸ 方案B：使用预编译 JAR（无需 Maven）
+    将有 Maven 环境的机器上编译好的 JAR 复制到：
+      yami-shop-admin\target\yami-shop-admin-0.0.1-SNAPSHOT.jar
+      yami-shop-api\target\yami-shop-api-0.0.1-SNAPSHOT.jar
+    然后重新启动本程序
+"@
+                [System.Windows.MessageBox]::Show($msg, "Mall4j Launcher - Maven 未安装", "OK", "Warning")
+                Enable-Buttons -Start $true -Stop $false
+                Stop-StepTimer
+                $script:Step = -1
+                return
+            }
             Set-StepDirect -Id 3 -Status "running" -Text "Building..."
             Set-Status -Text "Building backend (~1-3 min)..." -Color "#FFC300"
             Write-LogDirect -Message "Building backend..." -Level "INFO"

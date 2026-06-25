@@ -179,6 +179,17 @@ try {
         Write-LogUI -Message "Pre-built JARs found, skipping Maven build" -Level "SUCCESS"
         Set-StepUI -Id 3 -Status "completed" -Text "Skipped (JARs exist)"
     } else {
+        # JAR 不存在，检查 Maven 是否可用
+        $mvnCheck = Check-Maven
+        if (-not $mvnCheck.Ok) {
+            Write-LogUI -Message "Maven not installed and no pre-built JARs found" -Level "ERROR"
+            Write-LogUI -Message "Install Maven: winget install Apache.Maven  OR  https://maven.apache.org/download.cgi" -Level "INFO"
+            Write-LogUI -Message "Or copy pre-built JARs to: yami-shop-admin/target/ and yami-shop-api/target/" -Level "INFO"
+            Set-StepUI -Id 3 -Status "failed" -Text "Maven not found"
+            Set-StatusBarUI -Text "Maven not installed" -Color "#FA5151"
+            Enable-ButtonsUI -Start $true -Stop $false
+            throw "Abort: Maven not installed and no pre-built JARs"
+        }
         Set-StepUI -Id 3 -Status "running" -Text "Building..."
         Set-StatusBarUI -Text "Building backend (~1-3 min)..." -Color "#FFC300"
         try {
