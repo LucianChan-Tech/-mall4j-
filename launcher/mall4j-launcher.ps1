@@ -52,7 +52,6 @@ if (-not $script:ScriptDir) {
 }
 
 $script:ProjectRoot = Resolve-Path (Join-Path $script:ScriptDir "..")
-$script:ModulesDir = Join-Path $script:ScriptDir "modules"
 
 # Validate project root
 if (-not (Test-Path (Join-Path $script:ProjectRoot "pom.xml"))) {
@@ -62,11 +61,559 @@ if (-not (Test-Path (Join-Path $script:ProjectRoot "pom.xml"))) {
     exit 1
 }
 
-# Load modules
-. (Join-Path $ModulesDir "EnvCheck.ps1")
-. (Join-Path $ModulesDir "ConfigManager.ps1")
-. (Join-Path $ModulesDir "ServiceManager.ps1")
-. (Join-Path $ModulesDir "LogManager.ps1")
+# ===== 内联模块：EnvCheck.ps1 =====
+function Test-CommandExists {
+    param([string]$Command)
+    $oldPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Stop'
+    try {
+        if (Get-Command $Command -ErrorAction Stop) { return $true }
+    } catch { return $false }
+    finally { $ErrorActionPreference = $oldPreference }
+}
+
+function Find-MySqlClient {
+    $paths = @(
+        "$env:ProgramFiles\MySQL\MySQL Server 8.0\bin\mysql.exe",
+        "$env:ProgramFiles\MySQL\MySQL Server 8.4\bin\mysql.exe",
+        "$env:ProgramFiles\MySQL\MySQL Server 9.0\bin\mysql.exe",
+        "$env:ProgramFiles(x86)\MySQL\MySQL Server 8.0\bin\mysql.exe",
+        "${env:ProgramFiles}\MySQL\MySQL Server 5.7\bin\mysql.exe"
+    )
+    foreach ($p in $paths) {
+        if (Test-Path $p) { return $p }
+    }
+    if (Test-CommandExists "mysql") { return "mysql" }
+    return $null
+}
+
+function Check-JDK {
+    $result = @{ Installed = $false; Version = $null; Path = $null; Ok = $false }
+    try {
+        $javaOut = & java -version 2>&1
+        $versionStr = ($javaOut -join "`n")
+        if ($versionStr -match '"(\d+)\.?(\d+)?') {
+            $majorVer = [int]$matches[1]
+            $result.Installed = $true
+            $result.Version = $majorVer
+            $result.Path = (Get-Command java).Source
+            $result.Ok = $majorVer -ge 17
+        }
+    } catch { $result.Installed = $false }
+    return $result
+}
+
+function Check-Maven {
+    $result = @{ Installed = $false; Version = $null; Ok = $false }
+    try {
+        $mvnOut = & mvn --version 2>&1
+        $firstLine = ($mvnOut -join "`n")
+        if ($firstLine -match 'Apache Maven (\S+)') {
+            $result.Installed = $true
+            $result.Version = $matches[1]
+            $result.Ok = $true
+        }
+    } catch { $result.Installed = $false }
+    return $result
+}
+
+function Check-NodeJS {
+    $result = @{ Installed = $false; Version = $null; Ok = $false }
+    try {
+        $nodeOut = & node --version 2>&1
+        $verStr = "$nodeOut".Trim()
+        if ($verStr -match 'v?(\d+)') {
+            $majorVer = [int]$matches[1]
+            $result.Installed = $true
+            $result.Version = $verStr
+            $result.Ok = $majorVer -ge 18
+        }
+    } catch { $result.Installed = $false }
+    return $result
+}
+
+function Check-Pnpm {
+    $result = @{ Installed = $false; Version = $null; Ok = $false }
+    try {
+        $pnpmOut = & pnpm --version 2>&1
+        $result.Installed = $true
+        $result.Version = "$pnpmOut".Trim()
+        $result.Ok = $true
+    } catch { $result.Installed = $false }
+    return $result
+}
+
+function Check-Docker {
+    $result = @{ Running = $false; Info = $null; Ok = $false }
+    try {
+        $dockerOut = & docker info 2>&1
+        $output = "$dockerOut"
+        if ($output -match '(?i)(Server Version|Containers:)') {
+            $result.Running = $true
+            $result.Ok = $true
+            $result.Info = "Docker is running"
+        } elseif ($output -match 'docker desktop') {
+            $result.Running = $false
+            $result.Info = "Docker Desktop not started"
+        } else {
+            $result.Running = $false
+            $result.Info = "Docker not available"
+        }
+    } catch {
+        $result.Running = $false
+        $result.Info = "Docker not available"
+    }
+    return $result
+}
+
+function Check-Port {
+    param([int]$Port)
+    $result = @{ InUse = $false; ProcessName = $null; Pid = $null }
+    try {
+        $lines = netstat -ano | Select-String ":$Port\s" | Select-String "LISTEN|听.*$|ESCUCH|ECOUTE|LAUSCHE"
+        $conn = $lines | Select-Object -First 1
+        if ($conn) {
+            $result.InUse = $true
+            $line = $conn.Line -split '\s+'
+            if ($line.Count -ge 5) {
+                $result.Pid = [int]$line[-1]
+                try {
+                    $proc = Get-Process -Id $result.Pid -ErrorAction Stop
+                    $result.ProcessName = $proc.ProcessName
+                } catch { $result.ProcessName = "unknown" }
+            }
+        }
+    } catch {}
+    return $result
+}
+
+function Test-MySqlConnection {
+    param(
+        [string]$User = "root",
+        [string]$Password = "",
+        [string]$DbHost = "127.0.0.1",
+        [int]$Port = 3306
+    )
+    $result = @{ Success = $false; Message = $null; DatabaseExists = $false }
+    $portCheck = Check-Port -Port $Port
+    if (-not $portCheck.InUse) {
+        $result.Message = "MySQL port $Port is not listening. Make sure MySQL is running."
+        return $result
+    }
+    $mysqlExe = Find-MySqlClient
+    if ($mysqlExe) {
+        try {
+            $testArgs = @("-u", $User, "-p$Password", "-h", $DbHost, "-P", "$Port", "-e", "SELECT 1")
+            $mysqlOut = & $mysqlExe $testArgs 2>&1
+            $output = "$mysqlOut"
+            if ($output -match "ERROR") {
+                if ($output -match "Access denied") {
+                    $result.Message = "MySQL connection failed: wrong username or password"
+                } elseif ($output -match "Can't connect") {
+                    $result.Message = "MySQL connection failed: cannot connect to $DbHost`:$Port"
+                } else {
+                    $trimmed = $output.Substring(0, [Math]::Min(100, $output.Length))
+                    $result.Message = "MySQL error: $trimmed"
+                }
+                return $result
+            }
+            $result.Success = $true
+            $dbCheck = & $mysqlExe @("-u", $User, "-p$Password", "-h", $DbHost, "-P", "$Port", "-e", "SHOW DATABASES LIKE 'yami_shops'") 2>&1
+            if ("$dbCheck" -match "yami_shops") {
+                $result.DatabaseExists = $true
+                $result.Message = "MySQL connected, database yami_shops exists"
+            } else {
+                $result.DatabaseExists = $false
+                $result.Message = "MySQL connected, but yami_shops database does not exist"
+            }
+            return $result
+        } catch {
+            $result.Message = "MySQL check error: $_"
+            return $result
+        }
+    }
+    $result.Success = $true
+    $result.Message = "mysql client not found, but port $Port is listening (verify credentials manually)"
+    return $result
+}
+
+function Check-ProjectStructure {
+    param([string]$ProjectRoot)
+    $checks = @{}
+    $requiredPaths = @{
+        "pom.xml"               = "Maven root config"
+        "yami-shop-admin"       = "admin module"
+        "yami-shop-api"         = "api module"
+        "front-end/mall4v"      = "mall4v frontend"
+        "front-end/mall4uni"    = "mall4uni frontend"
+        "db/yami_shop.sql"      = "DB init script"
+    }
+    $allOk = $true
+    foreach ($path in $requiredPaths.Keys) {
+        $fullPath = Join-Path $ProjectRoot $path
+        $exists = Test-Path $fullPath
+        $checks[$path] = @{ Exists = $exists; Label = $requiredPaths[$path] }
+        if (-not $exists) { $allOk = $false }
+    }
+    return @{ Ok = $allOk; Message = if ($allOk) { "Project structure OK" } else { "Project structure incomplete" }; Checks = $checks }
+}
+
+function Get-FullEnvironmentReport {
+    param([string]$ProjectRoot)
+    return @{
+        JDK      = Check-JDK
+        Maven    = Check-Maven
+        NodeJS   = Check-NodeJS
+        Pnpm     = Check-Pnpm
+        Docker   = Check-Docker
+        Port3306 = Check-Port -Port 3306
+        Port6379 = Check-Port -Port 6379
+        Port8085 = Check-Port -Port 8085
+        Port8086 = Check-Port -Port 8086
+        Port9527 = Check-Port -Port 9527
+        Port5173 = Check-Port -Port 5173
+        Project  = Check-ProjectStructure -ProjectRoot $ProjectRoot
+    }
+}
+
+# ===== 内联模块：ConfigManager.ps1 =====
+$script:ConfigPath = Join-Path $env:APPDATA "Mall4jLauncher"
+$script:ConfigFile = Join-Path $script:ConfigPath "config.xml"
+
+function Get-DefaultConfigFromYml {
+    param([string]$ProjectRoot)
+    $config = @{ MysqlUser = "root"; MysqlPass = ""; RedisHost = "127.0.0.1"; RedisPort = 6379; DbName = "yami_shops"; Profile = "dev" }
+    $ymlPaths = @(
+        (Join-Path $ProjectRoot "yami-shop-admin/src/main/resources/application-dev.yml"),
+        (Join-Path $ProjectRoot "yami-shop-api/src/main/resources/application-dev.yml")
+    )
+    foreach ($ymlPath in $ymlPaths) {
+        if (Test-Path $ymlPath) {
+            try {
+                $content = Get-Content $ymlPath -Raw -Encoding UTF8
+                if ($content -match 'username:\s*(\S+)') { $config.MysqlUser = $matches[1] }
+                if ($content -match "password:\s*'([^']*)'") { $config.MysqlPass = $matches[1] }
+                elseif ($content -match 'password:\s*"([^"]*)"') { $config.MysqlPass = $matches[1] }
+                elseif ($content -match 'password:\s*(\S+)') { $config.MysqlPass = $matches[1] }
+                if ($content -match 'host:\s*(\S+)') { $config.RedisHost = $matches[1] }
+                if ($content -match 'port:\s*(\d+)') { $config.RedisPort = [int]$matches[1] }
+                break
+            } catch { }
+        }
+    }
+    return $config
+}
+
+function Save-UserConfig {
+    param([hashtable]$Config)
+    if (-not (Test-Path $script:ConfigPath)) { New-Item -ItemType Directory -Path $script:ConfigPath -Force | Out-Null }
+    $encryptedPass = ""
+    if ($Config.ContainsKey("MysqlPass") -and -not [string]::IsNullOrEmpty($Config.MysqlPass)) {
+        $secureStr = ConvertTo-SecureString $Config.MysqlPass -AsPlainText -Force
+        $encryptedPass = ConvertFrom-SecureString $secureStr
+    }
+    $xmlContent = @"`<?xml version="1.0" encoding="utf-8"?>
+<config>
+  <mysqlUser>$($Config.MysqlUser)</mysqlUser>
+  <mysqlPassEncrypted>$encryptedPass</mysqlPassEncrypted>
+  <redisHost>$($Config.RedisHost)</redisHost>
+  <redisPort>$($Config.RedisPort)</redisPort>
+  <profile>dev</profile>
+</config>
+"@
+    try { [System.IO.File]::WriteAllText($script:ConfigFile, $xmlContent, [System.Text.Encoding]::UTF8); return $true }
+    catch { return $false }
+}
+
+function Load-UserConfig {
+    if (-not (Test-Path $script:ConfigFile)) { return $null }
+    try {
+        [xml]$xml = Get-Content $script:ConfigFile -Encoding UTF8
+        $config = @{}
+        if ($xml.config.mysqlUser) { $config.MysqlUser = $xml.config.mysqlUser }
+        if ($xml.config.mysqlPassEncrypted -and $xml.config.mysqlPassEncrypted -ne "") {
+            try {
+                $secureStr = ConvertTo-SecureString $xml.config.mysqlPassEncrypted
+                $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureStr)
+                $config.MysqlPass = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+                [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+            } catch { $config.MysqlPass = "" }
+        } else { $config.MysqlPass = "" }
+        if ($xml.config.redisHost) { $config.RedisHost = $xml.config.redisHost }
+        if ($xml.config.redisPort) { $config.RedisPort = [int]$xml.config.redisPort }
+        return $config
+    } catch { return $null }
+}
+
+function Clear-UserConfig {
+    if (Test-Path $script:ConfigFile) { Remove-Item $script:ConfigFile -Force }
+}
+
+# ===== 内联模块：ServiceManager.ps1 =====
+$script:ServiceJobs = @{}
+
+function Start-DockerDesktop {
+    $dockerCheck = & docker info 2>&1
+    if ("$dockerCheck" -match '(?i)(Server Version|Containers:)') { return $true }
+    $knownPaths = @(
+        "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe",
+        "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe",
+        "${env:ProgramFiles(x86)}\Docker\Docker\Docker Desktop.exe",
+        "$env:LOCALAPPDATA\Docker\Docker Desktop.exe",
+        "$env:ProgramW6432\Docker\Docker\Docker Desktop.exe"
+    )
+    $dockerExe = $null
+    foreach ($p in $knownPaths) { if (Test-Path $p) { $dockerExe = $p; break } }
+    if (-not $dockerExe) {
+        $startMenu = [Environment]::GetFolderPath('CommonStartMenu')
+        $shortcut = Get-ChildItem -Path "$startMenu\*" -Recurse -Include "Docker Desktop.lnk" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($shortcut) { $dockerExe = $shortcut.FullName }
+    }
+    if (-not $dockerExe -and (Get-Command docker -ErrorAction SilentlyContinue)) {
+        $dockerCmd = (Get-Command docker).Source
+        $dockerExe = Join-Path (Split-Path $dockerCmd -Parent) "Docker Desktop.exe"
+        if (-not (Test-Path $dockerExe)) { $dockerExe = $null }
+    }
+    if (-not $dockerExe) { return $false }
+    try { $proc = Start-Process -FilePath $dockerExe -WindowStyle Hidden -PassThru; return $true }
+    catch { return $false }
+}
+
+function Wait-ForDockerDaemon {
+    param([int]$TimeoutSeconds = 60)
+    $startTime = Get-Date
+    while ((Get-Date) -lt $startTime.AddSeconds($TimeoutSeconds)) {
+        $dockerCheck = & docker info 2>&1
+        if ("$dockerCheck" -match '(?i)(Server Version|Containers:)') { return $true }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
+function Test-PortListening {
+    param([int]$Port)
+    $lines = netstat -an 2>&1 | Select-String ":$Port\s" | Select-String "LISTEN|听|ESCUCH|ECOUTE|LAUSCHE"
+    return [bool]$lines
+}
+
+function Wait-ForPort {
+    param([int]$Port, [int]$TimeoutSeconds = 60)
+    $startTime = Get-Date
+    while ((Get-Date) -lt $startTime.AddSeconds($TimeoutSeconds)) {
+        $check = Check-Port -Port $Port
+        if ($check.InUse) { return $true }
+        Start-Sleep -Milliseconds 1000
+    }
+    return $false
+}
+
+function Start-RedisService {
+    param([scriptblock]$LogCallback)
+    if (-not $LogCallback) { $LogCallback = { param($m) } }
+    $result = @{ Success = $false; Message = "" }
+    $portCheck = Check-Port -Port 6379
+    if ($portCheck.InUse) {
+        $result.Success = $true; $result.Message = "Redis already running (port 6379)"
+        & $LogCallback "Redis already running (port 6379)"; return $result
+    }
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        $result.Message = "Docker command not found. Please install Docker Desktop first."
+        & $LogCallback "Docker command not found. Please install Docker Desktop first."; return $result
+    }
+    $dockerCheck = & docker info 2>&1
+    $dockerOk = "$dockerCheck" -match '(?i)(Server Version|Containers:)'
+    if (-not $dockerOk) {
+        & $LogCallback "Docker Desktop not running, attempting to start..."
+        $started = Start-DockerDesktop
+        if ($started) {
+            & $LogCallback "Docker Desktop launch initiated, waiting for daemon..."
+            $waited = Wait-ForDockerDaemon -TimeoutSeconds 60
+            if (-not $waited) {
+                $result.Message = "Docker Desktop did not become ready within 60s"
+                & $LogCallback "Docker Desktop did not become ready within 60s"; return $result
+            }
+            & $LogCallback "Docker Desktop is now ready"
+        } else {
+            & $LogCallback "Could not find Docker Desktop executable."
+            $result.Message = "Docker Desktop not found. Please start it manually."; return $result
+        }
+    }
+    & $LogCallback "Starting Redis (Docker)..."
+    $maxRetries = 3; $attempt = 0
+    while ($attempt -lt $maxRetries) {
+        $attempt++; & $LogCallback "  Attempt $attempt/$maxRetries..."
+        & docker rm -f yami-redis 2>&1 | Out-Null
+        & docker pull redis:5.0.4 2>&1 | Out-Null
+        & docker run -d --name yami-redis -p 6379:6379 redis:5.0.4 2>&1 | Out-Null
+        $waitStart = Get-Date; $portReady = $false
+        while ((Get-Date) -lt $waitStart.AddSeconds(20)) {
+            if (Test-PortListening -Port 6379) { $portReady = $true; break }
+            Start-Sleep -Milliseconds 1000
+        }
+        if ($portReady) {
+            $result.Success = $true; $result.Message = "Redis started"
+            & $LogCallback "Redis started (127.0.0.1:6379)"; return $result
+        }
+        if ($attempt -lt $maxRetries) {
+            & $LogCallback "  Port 6379 not ready, retrying..."
+            & docker rm -f yami-redis 2>&1 | Out-Null; Start-Sleep -Seconds 2
+        }
+    }
+    $inspect = & docker inspect yami-redis --format '{{.State.Status}}' 2>&1
+    & $LogCallback "Redis container status: $inspect"
+    $result.Message = "Redis failed to start after $maxRetries attempts"
+    & $LogCallback "Redis failed to start. Check Docker Desktop and try manually:"
+    & $LogCallback "  docker run -d --name yami-redis -p 6379:6379 redis:5.0.4"
+    return $result
+}
+
+function Start-BackendService {
+    param([ValidateSet("admin", "api")][string]$ServiceName, [string]$ProjectRoot, [scriptblock]$LogCallback, [int]$TimeoutSeconds = 90)
+    if (-not $LogCallback) { $LogCallback = { param($m) } }
+    $result = @{ Success = $false; Message = ""; Process = $null }
+    $port = if ($ServiceName -eq "admin") { 8085 } else { 8086 }
+    $jarDir = Join-Path $ProjectRoot "yami-shop-$ServiceName/target"
+    $jarFile = Join-Path $jarDir "yami-shop-$ServiceName-0.0.1-SNAPSHOT.jar"
+    $portCheck = Check-Port -Port $port
+    if ($portCheck.InUse) {
+        if ($portCheck.ProcessName -eq "java") {
+            $result.Success = $true; $result.Message = "$ServiceName already running (port $port)"
+            & $LogCallback "$ServiceName already running (port $port)"; return $result
+        } else {
+            $result.Message = "Port $port in use by $($portCheck.ProcessName)"
+            & $LogCallback "Port $port in use by $($portCheck.ProcessName)"; return $result
+        }
+    }
+    if (-not (Test-Path $jarFile)) {
+        $result.Message = "JAR not found: $jarFile"; & $LogCallback "JAR not found: $jarFile. Build first."; return $result
+    }
+    & $LogCallback "Starting $ServiceName backend (port $port)..."
+    try {
+        $jobName = "mall4j-$ServiceName"
+        $jobScript = { param($JarPath, $Port) $logFile = Join-Path $env:TEMP "mall4j-$Port.log"; $p = Start-Process -FilePath "java" -ArgumentList "-jar -Dspring.profiles.active=dev -Xms512m -Xmx512m `"$JarPath`"" -NoNewWindow -PassThru -RedirectStandardOutput $logFile -RedirectStandardError $logFile; $p.WaitForExit() }
+        $job = Start-Job -Name $jobName -ScriptBlock $jobScript -ArgumentList $jarFile, $port
+        $script:ServiceJobs[$ServiceName] = $job
+        & $LogCallback "Waiting for $ServiceName (max ${TimeoutSeconds}s)..."
+        $waitOk = Wait-ForPort -Port $port -TimeoutSeconds $TimeoutSeconds
+        if ($waitOk) { $result.Success = $true; $result.Message = "$ServiceName started"; & $LogCallback "$ServiceName started (port $port)" }
+        else { $result.Message = "$ServiceName start timeout"; & $LogCallback "$ServiceName start timeout" }
+    } catch { $result.Message = "$ServiceName error: $_"; & $LogCallback "$ServiceName error: $_" }
+    return $result
+}
+
+function Start-FrontendService {
+    param([ValidateSet("mall4v", "mall4uni")][string]$FrontendName, [string]$ProjectRoot, [scriptblock]$LogCallback, [int]$TimeoutSeconds = 120)
+    if (-not $LogCallback) { $LogCallback = { param($m) } }
+    $result = @{ Success = $false; Message = ""; Port = 0 }
+    $frontendDir = Join-Path $ProjectRoot "front-end/$FrontendName"
+    $port = if ($FrontendName -eq "mall4v") { 9527 } else { 5173 }
+    $pkgMgr = if ($FrontendName -eq "mall4v") { "pnpm" } else { "npm" }
+    $devCmd = if ($FrontendName -eq "mall4v") { "pnpm dev" } else { "npm run dev" }
+    $portCheck = Check-Port -Port $port
+    if ($portCheck.InUse) { $result.Success = $true; $result.Port = $port; $result.Message = "$FrontendName already running (port $port)"; & $LogCallback "$FrontendName already running (port $port)"; return $result }
+    if (-not (Test-Path $frontendDir)) { $result.Message = "Directory not found: $frontendDir"; & $LogCallback "Directory not found: front-end/$FrontendName"; return $result }
+    $nodeModules = Join-Path $frontendDir "node_modules"
+    if (-not (Test-Path $nodeModules)) {
+        & $LogCallback "Installing $FrontendName dependencies..."
+        try { $installProc = Start-Process -FilePath $pkgMgr -ArgumentList "--prefix", $frontendDir, "install" -NoNewWindow -PassThru -Wait -RedirectStandardOutput "$env:TEMP\${FrontendName}_install.log" -RedirectStandardError "$env:TEMP\${FrontendName}_install_err.log"
+            if ($installProc.ExitCode -ne 0) { $result.Message = "Dependency install failed"; & $LogCallback "Dependency install failed for $FrontendName"; return $result }
+            & $LogCallback "Dependencies installed for $FrontendName"
+        } catch { $result.Message = "Install error: $_"; & $LogCallback "Install error for ${FrontendName}: $_"; return $result }
+    }
+    & $LogCallback "Starting $FrontendName dev server (port $port)..."
+    try {
+        $jobName = "frontend-$FrontendName"; $jobScript = { param($Dir) Set-Location $Dir; $logFile = Join-Path $env:TEMP "mall4j-frontend.log"; $p = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile -Command `"& {pnpm dev}`"" -NoNewWindow -PassThru; $p.WaitForExit() }
+        $job = Start-Job -Name $jobName -ScriptBlock $jobScript -ArgumentList $frontendDir; $script:ServiceJobs[$jobName] = $job
+        $waitOk = Wait-ForPort -Port $port -TimeoutSeconds $TimeoutSeconds
+        if ($waitOk) { $result.Success = $true; $result.Port = $port; $result.Message = "$FrontendName started"; & $LogCallback "$FrontendName started (http://localhost:$port)" }
+        else { $result.Message = "$FrontendName start timeout"; & $LogCallback "$FrontendName start timeout (${TimeoutSeconds}s)" }
+    } catch { $result.Message = "$FrontendName error: $_"; & $LogCallback "$FrontendName error: $_" }
+    return $result
+}
+
+function Invoke-MavenBuild {
+    param([string]$ProjectRoot, [string]$Module = "", [scriptblock]$LogCallback, [int]$TimeoutSeconds = 300)
+    if (-not $LogCallback) { $LogCallback = { param($m) } }
+    $result = @{ Success = $false; Message = ""; Duration = 0 }
+    $mvnArgs = @("clean", "package", "-DskipTests")
+    if ($Module) { $mvnArgs = @("clean", "package", "-pl", "yami-shop-$Module", "-am", "-DskipTests") }
+    $moduleLabel = if ($Module) { $Module } else { "all modules" }
+    & $LogCallback "Building backend ($moduleLabel)..."; & $LogCallback "  mvn $($mvnArgs -join ' ')"
+    $startTime = Get-Date; $logFile = "$env:TEMP\mall4j_maven_build.log"
+    try {
+        $proc = Start-Process -FilePath "mvn" -ArgumentList $mvnArgs -NoNewWindow -PassThru -WorkingDirectory $ProjectRoot -RedirectStandardOutput $logFile -RedirectStandardError "${logFile}.err"
+        $proc.WaitForExit($TimeoutSeconds * 1000)
+        $duration = [int]((Get-Date) - $startTime).TotalSeconds; $result.Duration = $duration
+        if ($proc.ExitCode -eq 0) { $result.Success = $true; $result.Message = "Build OK (${duration}s)"; & $LogCallback "Build OK (${duration}s)" }
+        else { & $LogCallback "Build FAILED"; Get-Content $logFile -Tail 10 -ErrorAction SilentlyContinue | ForEach-Object { & $LogCallback "  $_" }; $result.Message = "Build failed" }
+    } catch { $result.Message = "Build error: $_"; & $LogCallback "Build error: $_" }
+    return $result
+}
+
+function Import-Database {
+    param([string]$ProjectRoot, [string]$User = "root", [string]$Password = "", [scriptblock]$LogCallback)
+    if (-not $LogCallback) { $LogCallback = { param($m) } }
+    $result = @{ Success = $false; Message = "" }
+    $sqlFile = Join-Path $ProjectRoot "db/yami_shop.sql"
+    if (-not (Test-Path $sqlFile)) { $result.Message = "SQL file not found: $sqlFile"; & $LogCallback "SQL file not found: db/yami_shop.sql"; return $result }
+    $mysqlExe = Find-MySqlClient
+    if (-not $mysqlExe) { $result.Message = "mysql client not found. Import manually: db/yami_shop.sql"; & $LogCallback "mysql client not found. Import db/yami_shop.sql manually."; return $result }
+    & $LogCallback "Importing database yami_shops..."
+    try {
+        & $mysqlExe "-u$User" "-p$Password" -e "CREATE DATABASE IF NOT EXISTS `yami_shops` DEFAULT CHARSET utf8mb4 COLLATE utf8mb4_general_ci" 2>&1 | Out-Null
+        $importProc = Start-Process -FilePath $mysqlExe -ArgumentList "-u$User", "-p$Password", "yami_shops" -NoNewWindow -PassThru -RedirectStandardInput $sqlFile -RedirectStandardOutput "$env:TEMP\mysql_import.log" -RedirectStandardError "$env:TEMP\mysql_import_err.log"
+        $importProc.WaitForExit(120000)
+        if ($importProc.ExitCode -eq 0) { $result.Success = $true; $result.Message = "Database imported"; & $LogCallback "Database yami_shops imported" }
+        else { $errMsg = Get-Content "$env:TEMP\mysql_import_err.log" -Raw -ErrorAction SilentlyContinue; $result.Message = "Import failed: $errMsg"; & $LogCallback "Import failed: $errMsg" }
+    } catch { $result.Message = "Import error: $_"; & $LogCallback "Import error: $_" }
+    return $result
+}
+
+function Stop-AllServices {
+    param([scriptblock]$LogCallback)
+    if (-not $LogCallback) { $LogCallback = { param($m) } }
+    & $LogCallback "Stopping all services..."
+    @("admin", "api").ForEach({ if ($script:ServiceJobs.ContainsKey($_)) { Stop-Job -Job $script:ServiceJobs[$_] -ErrorAction SilentlyContinue; Remove-Job -Job $script:ServiceJobs[$_] -ErrorAction SilentlyContinue } })
+    @("frontend-mall4v", "frontend-mall4uni").ForEach({ if ($script:ServiceJobs.ContainsKey($_)) { Stop-Job -Job $script:ServiceJobs[$_] -ErrorAction SilentlyContinue; Remove-Job -Job $script:ServiceJobs[$_] -ErrorAction SilentlyContinue } })
+    $javaProcs = Get-Process -Name "java" -ErrorAction SilentlyContinue | Where-Object { try { $_.CommandLine -match "yami-shop" } catch { $false } }
+    if ($javaProcs) { $javaProcs | Stop-Process -Force -ErrorAction SilentlyContinue; & $LogCallback "Stopped $($javaProcs.Count) Java process(es)" }
+    & $LogCallback "All services stopped"
+}
+
+# ===== 内联模块：LogManager.ps1 =====
+$script:LogFilePath = $null
+
+function Initialize-Log {
+    param([string]$LogDir)
+    $logDir = if ($LogDir) { $LogDir } else { Join-Path $PSScriptRoot "logs" }
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $script:LogFilePath = Join-Path $logDir "mall4j-launcher-$timestamp.log"
+    $header = "============================================" + "`r`n Mall4j Launcher Log Started at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" + "`r`n============================================"
+    Add-Content -Path $script:LogFilePath -Value $header -Encoding UTF8
+}
+
+function Write-LauncherLog {
+    param([string]$Message, [ValidateSet("INFO","WARN","ERROR","DEBUG","SUCCESS")][string]$Level = "INFO", [scriptblock]$UIFunc = $null)
+    $timestamp = Get-Date -Format "HH:mm:ss.fff"; $logLine = "[$timestamp][$Level] $Message"
+    if ($script:LogFilePath) { Add-Content -Path $script:LogFilePath -Value $logLine -Encoding UTF8 }
+    if ($UIFunc) { try { & $UIFunc $Message $Level } catch {} }
+    switch ($Level) {
+        "ERROR"   { Write-Host $logLine -ForegroundColor Red }
+        "WARN"    { Write-Host $logLine -ForegroundColor Yellow }
+        "SUCCESS" { Write-Host $logLine -ForegroundColor Green }
+        "DEBUG"   { Write-Host $logLine -ForegroundColor Gray }
+        default   { Write-Host $logLine -ForegroundColor White }
+    }
+}
+
+function Get-LogContent {
+    param([int]$Lines = 100)
+    if ($script:LogFilePath -and (Test-Path $script:LogFilePath)) { return Get-Content $script:LogFilePath -Tail $Lines -Encoding UTF8 -ErrorAction SilentlyContinue }
+    return @()
+}
+
+# ===== 模块加载结束 =====
 
 # Init log
 Initialize-Log -LogDir (Join-Path $script:ScriptDir "logs")
@@ -262,6 +809,7 @@ $script:StepApiResult = $null
 $script:StepMall4vResult = $null
 $script:StepMall4uniResult = $null
 $script:StepBuildResult = $null
+$script:RedisStartTime = $null
 
 function Start-StepTimer {
     $script:StepTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -358,26 +906,66 @@ function Process-Step {
             }
         }
         2 {  # Redis
-            Set-StepDirect -Id 2 -Status "running" -Text "Starting..."
-            $portCheck = Check-Port -Port 6379
-            if ($portCheck.InUse) {
-                Write-LogDirect -Message "Redis already running" -Level "SUCCESS"
-                Set-StepDirect -Id 2 -Status "completed" -Text "Already running"
-                $script:Step = 3
+            if (-not $script:RedisStartTime) {
+                # 第一次进入 Step 2：检查或启动 Redis
+                Set-StepDirect -Id 2 -Status "running" -Text "Starting..."
+                $portCheck = Check-Port -Port 6379
+                if ($portCheck.InUse) {
+                    Write-LogDirect -Message "Redis already running (port 6379)" -Level "SUCCESS"
+                    Set-StepDirect -Id 2 -Status "completed" -Text "Already running"
+                    $script:Step = 3
+                } else {
+                    Write-LogDirect -Message "Starting Redis..." -Level "INFO"
+                    # 检查 docker 命令
+                    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+                        Write-LogDirect -Message "Docker command not found. Please install Docker Desktop." -Level "ERROR"
+                        Set-StepDirect -Id 2 -Status "failed" -Text "Docker not found"
+                        Set-Status -Text "Redis failed: Docker not installed" -Color "#FA5151"
+                        Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1; return
+                    }
+                    # 检查 Docker Desktop 是否运行
+                    $dockerCheck = & docker info 2>&1
+                    if ("$dockerCheck" -notmatch '(?i)(Server Version|Containers:)') {
+                        Write-LogDirect -Message "Docker Desktop not running, attempting to start..." -Level "INFO"
+                        $ddStarted = Start-DockerDesktop
+                        if ($ddStarted) {
+                            Write-LogDirect -Message "Docker Desktop launch initiated..." -Level "INFO"
+                        } else {
+                            Write-LogDirect -Message "Could not find Docker Desktop. Please start it manually." -Level "WARN"
+                        }
+                    } else {
+                        Write-LogDirect -Message "Docker Desktop is running" -Level "INFO"
+                    }
+                    # 清理旧容器
+                    & docker rm -f yami-redis 2>&1 | Out-Null
+                    # 启动容器（docker run -d 异步返回，不等就绪）
+                    & docker run -d --name yami-redis -p 6379:6379 redis:5.0.4 2>&1 | Out-Null
+                    # 记录开始时间，进入轮询
+                    $script:RedisStartTime = Get-Date
+                    Write-LogDirect -Message "Redis container launched, polling port 6379..." -Level "INFO"
+                }
             } else {
-                Write-LogDirect -Message "Starting Redis..." -Level "INFO"
-                # 加载模块函数路径（供后台 job 使用）
-                $modulesDir = $script:ModulesDir
-                $logCbLocal = $logCb
-                $script:StepJob = Start-Job -Name "step-redis" -ScriptBlock {
-                    param($modDir, $cb)
-                    # 在 job 中重新加载模块
-                    . (Join-Path $modDir "EnvCheck.ps1")
-                    . (Join-Path $modDir "ServiceManager.ps1")
-                    $result = Start-RedisService -LogCallback $cb
-                    if ($result.Success) { return "OK" } else { return "FAILED:$($result.Message)" }
-                } -ArgumentList $modulesDir, $logCbLocal
-                Write-LogDirect -Message "Redis startup initiated, waiting..." -Level "INFO"
+                # 轮询模式：检查端口是否就绪
+                $check = Test-PortListening -Port 6379
+                $elapsed = [int]((Get-Date) - $script:RedisStartTime).TotalSeconds
+                if ($check) {
+                    Write-LogDirect -Message "Redis started (port 6379, ${elapsed}s)" -Level "SUCCESS"
+                    Set-StepDirect -Id 2 -Status "completed" -Text "Started (${elapsed}s)"
+                    $script:RedisStartTime = $null; $script:Step = 3
+                } elseif ($elapsed -ge 90) {
+                    Write-LogDirect -Message "Redis did not start within 90s, giving up" -Level "ERROR"
+                    # 检查容器状态
+                    $status = & docker inspect yami-redis --format '{{.State.Status}}' 2>&1
+                    Write-LogDirect -Message "  Container status: $status" -Level "INFO"
+                    Set-StepDirect -Id 2 -Status "failed" -Text "Timeout"
+                    Set-Status -Text "Redis start timeout" -Color "#FA5151"
+                    $script:RedisStartTime = $null
+                    Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1
+                }
+                # 未超时且未就绪：继续等待（不输出日志避免刷屏，每 10 秒提示一次）
+                elseif ($elapsed % 10 -eq 0) {
+                    Write-LogDirect -Message "  Waiting for Redis... (${elapsed}s)" -Level "INFO"
+                }
             }
         }
         3 {  # Build backend - start the build
@@ -422,7 +1010,8 @@ function Process-Step {
                 Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1; return
             }
             $logFile = "$env:TEMP\mall4j-admin.log"
-            $p = Start-Process -FilePath "java" -WindowStyle Hidden -ArgumentList "-jar -Dspring.profiles.active=dev -Xms512m -Xmx512m `"$jarFile`"" -PassThru -RedirectStandardOutput $logFile -RedirectStandardError "${logFile}.err"
+            $javaArgs = @("-jar", "-Dspring.profiles.active=dev", "-Dspring.datasource.username=$($script:StepUser)", "-Dspring.datasource.password=$($script:StepPass)", "-Xms512m", "-Xmx512m", "`"$jarFile`"")
+            $p = Start-Process -FilePath "java" -WindowStyle Hidden -ArgumentList $javaArgs -PassThru -RedirectStandardOutput $logFile -RedirectStandardError "${logFile}.err"
             if (-not $p) {
                 Write-LogDirect -Message "Failed to start admin process" -Level "ERROR"
                 Set-StepDirect -Id 4 -Status "failed" -Text "Launch failed"
@@ -452,7 +1041,8 @@ function Process-Step {
                 Enable-Buttons -Start $true -Stop $false; Stop-StepTimer; $script:Step = -1; return
             }
             $logFile = "$env:TEMP\mall4j-api.log"
-            $p = Start-Process -FilePath "java" -WindowStyle Hidden -ArgumentList "-jar -Dspring.profiles.active=dev -Xms512m -Xmx512m `"$jarFile`"" -PassThru -RedirectStandardOutput $logFile -RedirectStandardError "${logFile}.err"
+            $javaArgs = @("-jar", "-Dspring.profiles.active=dev", "-Dspring.datasource.username=$($script:StepUser)", "-Dspring.datasource.password=$($script:StepPass)", "-Xms512m", "-Xmx512m", "`"$jarFile`"")
+            $p = Start-Process -FilePath "java" -WindowStyle Hidden -ArgumentList $javaArgs -PassThru -RedirectStandardOutput $logFile -RedirectStandardError "${logFile}.err"
             if (-not $p) {
                 Write-LogDirect -Message "Failed to start api process" -Level "ERROR"
                 Set-StepDirect -Id 5 -Status "failed" -Text "Launch failed"
